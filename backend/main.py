@@ -20,7 +20,9 @@ from typing import List
 # from itsdangerous import URLSafeTimedSerializer # No longer used
 
 import firebase_admin
-from firebase_admin import credentials as firebase_credentials, auth as firebase_auth
+from firebase_admin import credentials as firebase_credentials, auth as firebase_auth, firestore
+from google.cloud.exceptions import NotFound as GoogleCloudNotFound
+
 
 load_dotenv()
 
@@ -151,6 +153,7 @@ class ChildDashboardData(BaseModel):
     progress_by_topic: List[TopicProgress]
     recent_activity_log: List[RecentActivity]
     performance_trends: List[PerformanceTrendPoint]
+    alerts: List[str] = []
 
 app = FastAPI()
 
@@ -377,36 +380,199 @@ async def get_child_dashboard_data(
 
     # Mock data construction
     # Ensure datetime and timedelta are available if not already imported at the top
-    # from datetime import datetime, timedelta (already imported)
+    db_fs = firestore.client()
+    child_firebase_uid = child_user.firebase_uid
 
-    mock_data = ChildDashboardData(
+    # Initialize default values
+    progress_by_topic_list = []
+    strengths_list = []
+    weaknesses_list = []
+    recent_activity_log_list = []
+    performance_trends_list = []
+    overall_curriculum_progress_val = 0.0
+    total_tutoring_time_week_val = 0
+    total_tutoring_time_month_val = 0
+    sessions_completed_week_val = 0
+    sessions_completed_month_val = 0
+    alerts_list = []
+
+    try:
+        # Fetch Topic Mastery
+        topics_ref = db_fs.collection('student_progress').document(child_firebase_uid).collection('topic_mastery')
+        topics_docs = topics_ref.stream()
+        for doc in topics_docs:
+            topic_data = doc.to_dict()
+            # Ensure required fields are present, provide defaults if not
+            progress_percentage = topic_data.get('progress_percentage', 0.0)
+            skill_rating = topic_data.get('skill_rating', 'Not Evaluated')
+            topic_name = topic_data.get('topic_name', doc.id) # Use doc.id as fallback for topic_name
+
+            progress_by_topic_list.append(TopicProgress(
+                topic_name=topic_name,
+                progress_percentage=progress_percentage,
+                skill_rating=skill_rating
+            ))
+            if progress_percentage >= 80: # Example threshold for strength
+                strengths_list.append(topic_name)
+            elif progress_percentage < 50: # Example threshold for weakness
+                weaknesses_list.append(topic_name)
+
+        # Fetch Overall Progress from student's main progress document
+        student_progress_doc_ref = db_fs.collection('student_progress').document(child_firebase_uid)
+        student_progress_doc = student_progress_doc_ref.get()
+        if student_progress_doc.exists:
+            overall_curriculum_progress_val = student_progress_doc.to_dict().get('overall_curriculum_progress', 0.0)
+
+        # Fetch Sessions for Recent Activity & Aggregations
+        # Fetch sessions from the last ~30 days for week/month calculations.
+        # For performance trends (e.g., last 4 weeks), might need more, or adjust trend detail.
+        now = datetime.utcnow().replace(tzinfo=timezone.utc) # Ensure timezone aware
+        start_of_month = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        start_of_week = now - timedelta(days=now.weekday())
+        start_of_week = start_of_week.replace(hour=0, minute=0, second=0, microsecond=0)
+
+        # For performance trends (last 4 weeks)
+        four_weeks_ago = now - timedelta(weeks=4)
+        four_weeks_ago = four_weeks_ago.replace(hour=0, minute=0, second=0, microsecond=0)
+
+        sessions_ref = db_fs.collection('student_progress').document(child_firebase_uid).collection('sessions')
+        # Query sessions from at least four_weeks_ago to cover all calculations
+        sessions_query = sessions_ref.where('timestamp', '>=', four_weeks_ago).order_by('timestamp', direction=firestore.Query.DESCENDING)
+        session_docs = sessions_query.stream()
+
+        weekly_sessions_count = [0] * 4 # For last 4 weeks, current week is index 3
+
+        for doc in session_docs:
+            session_data = doc.to_dict()
+            session_timestamp_obj = session_data.get('timestamp')
+
+            # Convert Firestore Timestamp to datetime object if necessary
+            if isinstance(session_timestamp_obj, firestore.SERVER_TIMESTAMP.__class__): #This is a bit of a hack way to check type
+                 # If it's a server timestamp placeholder, it might not be resolved yet, skip or handle
+                continue
+            if not isinstance(session_timestamp_obj, datetime):
+                 # Attempt to parse if it's an ISO string, or handle other formats
+                try:
+                    session_timestamp_obj = datetime.fromisoformat(str(session_timestamp_obj).replace('Z', '+00:00'))
+                    if session_timestamp_obj.tzinfo is None: # Ensure tz-aware for comparison
+                        session_timestamp_obj = session_timestamp_obj.replace(tzinfo=timezone.utc)
+                except ValueError: # Skip if timestamp is not in a recognized format
+                    print(f"Warning: Skipping session with unparseable timestamp: {session_timestamp_obj}")
+                    continue
+
+            # Ensure timestamp is timezone-aware (UTC) for comparison
+            if session_timestamp_obj.tzinfo is None:
+                session_timestamp_obj = session_timestamp_obj.replace(tzinfo=timezone.utc)
+
+
+            # Recent Activity Log (limit to last 20 or so of the already time-filtered sessions)
+            if len(recent_activity_log_list) < 20:
+                 recent_activity_log_list.append(RecentActivity(
+                    timestamp=session_timestamp_obj.isoformat(),
+                    description=session_data.get('description', 'N/A'),
+                    duration_minutes=session_data.get('duration_minutes'),
+                    accuracy_percentage=session_data.get('accuracy_percentage')
+                ))
+
+            # Aggregations for week/month
+            duration = session_data.get('duration_minutes', 0)
+            if session_timestamp_obj >= start_of_week:
+                total_tutoring_time_week_val += duration
+                sessions_completed_week_val += 1
+            if session_timestamp_obj >= start_of_month:
+                total_tutoring_time_month_val += duration
+                sessions_completed_month_val += 1
+
+            # Performance Trends: sessions per week for the last 4 weeks
+            for i in range(4):
+                week_start_boundary = now - timedelta(weeks=(4-i))
+                week_start_boundary = week_start_boundary.replace(hour=0, minute=0, second=0, microsecond=0)
+                week_end_boundary = now - timedelta(weeks=(3-i)) # Non-inclusive end or adjust
+                week_end_boundary = week_end_boundary.replace(hour=0, minute=0, second=0, microsecond=0)
+
+                if week_start_boundary <= session_timestamp_obj < week_end_boundary :
+                     # This logic for weekly_sessions_count is simplified.
+                     # A more robust way is to group by week number after fetching.
+                     # For simplicity here, this might overcount if sessions are near boundaries.
+                     # Correct approach: determine week number for each session, then sum.
+                     # Let's adjust to assign to correct week bucket based on how many weeks ago it was
+                    delta_weeks = (now - session_timestamp_obj).days // 7
+                    if 0 <= delta_weeks < 4:
+                        # index 3 = current week, 2 = last week, ... 0 = 3 weeks ago
+                        week_index = 3 - delta_weeks
+                        weekly_sessions_count[week_index] +=1
+
+
+        # Create PerformanceTrendPoint data from weekly_sessions_count
+        for i in range(4):
+            # Date for the start of that week (Monday)
+            week_start_date = (now - timedelta(weeks=(3-i))).replace(hour=0, minute=0, second=0, microsecond=0)
+            week_start_date_monday = week_start_date - timedelta(days=week_start_date.weekday())
+            performance_trends_list.append(PerformanceTrendPoint(
+                date=week_start_date_monday.strftime("%Y-%m-%d"),
+                value=weekly_sessions_count[i]
+            ))
+
+        # Generate Alerts
+        # 1. Inactivity Alert
+        if recent_activity_log_list:
+            # recent_activity_log_list is sorted DESC by timestamp from query
+            most_recent_session_timestamp_str = recent_activity_log_list[0].timestamp
+            most_recent_session_dt = datetime.fromisoformat(most_recent_session_timestamp_str)
+            if (now - most_recent_session_dt).days > 5:
+                alerts_list.append(f"Child has not had a session in over 5 days (last session: {most_recent_session_dt.strftime('%Y-%m-%d')}).")
+        else:
+            # No sessions at all in the queried period (last 4 weeks)
+            # This could mean inactivity for longer, or a new student.
+            # For a more definitive "no sessions ever", one might need a separate check or rely on overall progress.
+            alerts_list.append("No recent sessions recorded in the last 4 weeks.")
+
+        # 2. New Topic Mastery Alert (Simplified)
+        mastery_alerts_count = 0
+        # Sort topics by last_practiced_timestamp if available, or just iterate
+        # For this simplified version, we iterate as is. A real version might need last_practiced_timestamp in TopicProgress.
+        # We'll use the progress_by_topic_list which is already populated.
+        # Let's assume topics_docs from earlier also had last_practiced_timestamp if we want to use it.
+        # For now, based on current TopicProgress model (no last_practiced):
+        for topic in progress_by_topic_list:
+            if mastery_alerts_count < 2: # Limit to 2 mastery alerts
+                if topic.progress_percentage == 100.0 or topic.skill_rating == "Excellent":
+                    # To make this "recent", we'd need a timestamp on the topic mastery itself,
+                    # or infer from recent sessions covering this topic.
+                    # The current data model for TopicProgress doesn't have a 'last_mastered_timestamp'.
+                    # We'll make a generic mastery alert.
+                    alerts_list.append(f"Great job! Progress made in {topic.topic_name} ({topic.skill_rating}, {topic.progress_percentage}%).")
+                    mastery_alerts_count += 1
+            else:
+                break
+
+    except GoogleCloudNotFound:
+        # This means the student_progress document or subcollections might not exist.
+        alerts_list.append("No progress data found for this child yet.")
+        # Defaults will be returned, which is acceptable.
+        print(f"No Firestore data found for child UID: {child_firebase_uid}. Returning defaults.")
+    except Exception as e:
+        # Log other potential errors (e.g., permission issues, data parsing)
+        print(f"Error fetching dashboard data from Firestore for child UID {child_firebase_uid}: {e}")
+        # Depending on policy, you might want to raise an HTTPException or return defaults.
+        # For now, returning defaults for robustness.
+        # Consider re-raising if it's a critical error: raise HTTPException(status_code=500, detail="Error fetching dashboard data.")
+
+    return ChildDashboardData(
         child_id=child_user_id,
-        child_full_name=child_user.full_name if child_user.full_name else "Child User", # Use actual child name
-        total_tutoring_time_week_minutes=120,
-        total_tutoring_time_month_minutes=480,
-        sessions_completed_week=5,
-        sessions_completed_month=20,
-        overall_curriculum_progress=75.5,
-        strengths=["Algebra", "Geometry"],
-        weaknesses=["Trigonometry"],
-        progress_by_topic=[
-            TopicProgress(topic_name="Algebra", progress_percentage=90.0, skill_rating="Excellent"),
-            TopicProgress(topic_name="Geometry", progress_percentage=80.0, skill_rating="Satisfactory"),
-            TopicProgress(topic_name="Trigonometry", progress_percentage=50.0, skill_rating="Needs Improvement"),
-        ],
-        recent_activity_log=[
-            RecentActivity(timestamp=datetime.utcnow().isoformat(), description="Completed session on Algebra", duration_minutes=30, accuracy_percentage=95.0),
-            RecentActivity(timestamp=(datetime.utcnow() - timedelta(days=1)).isoformat(), description="Practiced Trigonometry problems", duration_minutes=45, accuracy_percentage=60.0),
-            RecentActivity(timestamp=(datetime.utcnow() - timedelta(days=2)).isoformat(), description="Reviewed Geometry concepts", duration_minutes=25, accuracy_percentage=88.0),
-        ],
-        performance_trends=[
-            PerformanceTrendPoint(date=(datetime.utcnow() - timedelta(weeks=3)).strftime("%Y-%m-%d"), value=5.0), # e.g. hours
-            PerformanceTrendPoint(date=(datetime.utcnow() - timedelta(weeks=2)).strftime("%Y-%m-%d"), value=7.0),
-            PerformanceTrendPoint(date=(datetime.utcnow() - timedelta(weeks=1)).strftime("%Y-%m-%d"), value=6.0),
-            PerformanceTrendPoint(date=datetime.utcnow().strftime("%Y-%m-%d"), value=8.0),
-        ]
+        child_full_name=child_user.full_name if child_user.full_name else "Child User",
+        total_tutoring_time_week_minutes=total_tutoring_time_week_val,
+        total_tutoring_time_month_minutes=total_tutoring_time_month_val,
+        sessions_completed_week=sessions_completed_week_val,
+        sessions_completed_month=sessions_completed_month_val,
+        overall_curriculum_progress=overall_curriculum_progress_val,
+        strengths=strengths_list,
+        weaknesses=weaknesses_list,
+        progress_by_topic=progress_by_topic_list,
+        recent_activity_log=recent_activity_log_list, # Already sorted by Firestore query
+        performance_trends=performance_trends_list,
+        alerts=alerts_list
     )
-    return mock_data
 
 # Placeholder for future endpoints that might require the Firebase UID directly
 # @app.post("/some_action")

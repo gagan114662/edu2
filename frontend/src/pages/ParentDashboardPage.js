@@ -46,6 +46,18 @@ const ParentDashboardPage = () => {
       <div style={{ marginTop: '20px' }}>
         <h2>Dashboard for {dashboardData.child_full_name} (ID: {dashboardData.child_id})</h2>
 
+        {/* Alerts Section */}
+        {dashboardData.alerts && dashboardData.alerts.length > 0 && (
+          <div style={{ border: '1px solid #ffc107', backgroundColor: '#fff8e1', padding: '15px', margin: '20px 0', borderRadius: '8px' }}>
+            <h3 style={{ color: '#ffa000', marginTop: '0' }}>Important Alerts</h3>
+            <ul style={{ margin: 0, paddingLeft: '20px' }}>
+              {dashboardData.alerts.map((alert, index) => (
+                <li key={index} style={{ color: '#ffa000', marginBottom: '5px' }}>{alert}</li>
+              ))}
+            </ul>
+          </div>
+        )}
+
         <div style={cardStyle}>
           <h3>Engagement</h3>
           <p>Total tutoring time this week: {dashboardData.total_tutoring_time_week_minutes} minutes</p>
