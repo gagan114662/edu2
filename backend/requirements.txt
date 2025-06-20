@@ -9,6 +9,7 @@ requests
 psycopg2-binary
 SQLAlchemy
 python-dotenv
+google-generativeai
 # Testing dependencies
 pytest
 httpx

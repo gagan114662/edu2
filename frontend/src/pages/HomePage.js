@@ -1,6 +1,7 @@
 import React from 'react';
 import { useAuth } from '../context/AuthContext';
 import { useNavigate } from 'react-router-dom';
+import ChatInterface from '../components/ChatInterface'; // Added import
 
 const HomePage = () => {
     const { isAuthenticated, user, logout } = useAuth();
@@ -19,11 +20,12 @@ const HomePage = () => {
     }
 
     return (
-        <div className="flex flex-col items-center justify-center min-h-screen bg-gray-100 p-4">
-            <div className="p-8 bg-white shadow-md rounded-lg text-center">
-                <h1 className="text-3xl font-bold mb-4">Welcome to AI Tutor!</h1>
-                {user && user.picture_url && (
-                    <img
+        <div className="flex flex-col items-center min-h-screen bg-gray-100 p-4">
+            <div className="w-full max-w-4xl"> {/* Added a wrapper to constrain width */}
+                <div className="p-8 bg-white shadow-md rounded-lg text-center mb-6"> {/* Existing welcome box */}
+                    <h1 className="text-3xl font-bold mb-4">Welcome to AI Tutor!</h1>
+                    {user && user.picture_url && (
+                        <img
                         src={user.picture_url}
                         alt={user.name || 'User Avatar'}
                         className="w-24 h-24 rounded-full mx-auto mb-4 border-2 border-blue-500"
@@ -42,6 +44,10 @@ const HomePage = () => {
                 >
                     Logout
                 </button>
+                </div>
+
+                {/* Add ChatInterface below the welcome box */}
+                <ChatInterface />
             </div>
         </div>
     );

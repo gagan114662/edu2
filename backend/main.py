@@ -14,9 +14,18 @@ from fastapi import Request as FastAPIRequest # Renamed to avoid conflict with '
 from starlette.responses import Response as StarletteResponse # For setting cookies
 from dotenv import load_dotenv
 from pydantic import BaseModel
+from typing import List, Optional, Dict # Added
+import google.generativeai as genai # Added
+from google.generativeai.types import HarmCategory, HarmBlockThreshold # For safety settings
+import os # Already present, but good to ensure
 from itsdangerous import URLSafeTimedSerializer
 
 load_dotenv()
+
+# Gemini API Key
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+if GEMINI_API_KEY:
+    genai.configure(api_key=GEMINI_API_KEY)
 
 # Environment Variables
 # IMPORTANT: For production, ensure GOOGLE_CLIENT_SECRET and JWT_SECRET_KEY are securely managed (e.g., via secrets manager)
@@ -63,6 +72,19 @@ class UserResponse(BaseModel):
     picture_url: str | None = None
     class Config:
         from_attributes = True
+
+# Pydantic models for Tutor API
+class ChatMessage(BaseModel):
+    role: str # "user" or "model"
+    parts: List[str]
+
+class TutorQueryRequest(BaseModel):
+    query: str
+    history: Optional[List[ChatMessage]] = None
+    grade_level: Optional[str] = "middle school"
+
+class TutorQueryResponse(BaseModel):
+    reply: str
 
 app = FastAPI()
 
@@ -217,6 +239,69 @@ async def auth_google_callback(code: str, state: str, request: FastAPIRequest, d
 @app.get("/api/users/me", response_model=UserResponse)
 async def read_users_me(current_user: User = Depends(get_current_user)):
     return current_user
+
+@app.post("/api/askTutor", response_model=TutorQueryResponse)
+async def ask_tutor(
+    request: TutorQueryRequest,
+    current_user: User = Depends(get_current_user) # Ensure endpoint is protected
+):
+    if not GEMINI_API_KEY:
+        raise HTTPException(status_code=500, detail="Gemini API key not configured")
+
+    try:
+        # Construct conversation history for the model
+        generation_history = []
+        if request.history:
+            for msg in request.history:
+                generation_history.append({'role': msg.role, 'parts': [" ".join(msg.parts)]})
+
+        persona_prompt = (
+            f"You are a helpful and friendly AI tutor for K-12 students. "
+            f"Your current student is in {request.grade_level}. "
+            f"Your goal is to explain concepts clearly and provide age-appropriate examples. "
+            f"Please ensure your tone is encouraging and supportive. "
+            f"If a question is outside an academic K-12 context, politely decline to answer."
+        )
+
+        # Configure safety settings
+        safety_settings = {
+            HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE,
+            HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE,
+            HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE,
+            HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE,
+        }
+
+        # Re-initialize model with system instruction for better persona management
+        instructed_model = genai.GenerativeModel(
+            model_name='gemini-pro', # or gemini-1.5-flash etc.
+            safety_settings=safety_settings,
+            system_instruction=persona_prompt
+        )
+
+        # Re-initialize chat with the instructed model and actual history
+        chat_session = instructed_model.start_chat(history=generation_history if generation_history else [])
+
+        # Send the user's current query
+        response = chat_session.send_message(request.query)
+
+        # Check for empty or blocked response
+        if not response.parts:
+            if response.prompt_feedback and response.prompt_feedback.block_reason:
+                print(f"Gemini content generation blocked. Reason: {response.prompt_feedback.block_reason}")
+                raise HTTPException(status_code=400, detail="The request was blocked by content safety filters. Please rephrase your query.")
+            else:
+                print("Gemini response was empty without a specific block reason.")
+                raise HTTPException(status_code=500, detail="Received an empty response from the AI. Please try again.")
+
+        ai_reply = response.text # Accessing .text directly concatenates parts
+
+        return TutorQueryResponse(reply=ai_reply)
+
+    except Exception as e:
+        print(f"Error in ask_tutor endpoint: {e}")
+        if isinstance(e, HTTPException):
+            raise
+        raise HTTPException(status_code=500, detail=f"An error occurred while processing your request with the AI tutor: {str(e)}")
 
 @app.post("/api/auth/logout")
 async def logout_user(current_user: User = Depends(get_current_user)):
