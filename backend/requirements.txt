@@ -1,14 +1,15 @@
 fastapi
 uvicorn[standard]
-python-jose[cryptography]
-google-auth
-google-api-python-client
-google-auth-oauthlib
-itsdangerous # For signed cookies (OAuth state)
-requests
+# python-jose[cryptography] # REMOVED
+google-auth # firebase-admin might need this, or bring its own. Keep for now.
+# google-api-python-client # REMOVED (if only for OAuth user info)
+# google-auth-oauthlib # REMOVED
+# itsdangerous # REMOVED
+requests # Keep for now, might be used by other things or firebase-admin
 psycopg2-binary
 SQLAlchemy
 python-dotenv
+firebase-admin
 # Testing dependencies
 pytest
 httpx

@@ -1,149 +1,141 @@
 import pytest
 from fastapi.testclient import TestClient
-from unittest.mock import patch, MagicMock
-from backend.main import app, UserResponse # UserResponse for /api/users/me typing
-from jose import jwt # For creating test tokens
-from datetime import timedelta, datetime, timezone
+from unittest.mock import MagicMock # For mock_firebase_auth_sdk_fixture if needed as arg
+from backend.main import User, UserResponse # SQLAlchemy model and Pydantic response model
+from backend.tests.conftest import set_mock_firebase_token # Helper from conftest
+# Import specific Firebase auth errors if needed for specific exception testing
+from firebase_admin import auth as firebase_auth_errors
 
-# Helper to create a token for testing protected endpoints
-def create_test_access_token(email: str, secret_key: str, algorithm: str, expires_delta_minutes: int = 15):
-    expire = datetime.now(timezone.utc) + timedelta(minutes=expires_delta_minutes)
-    to_encode = {"sub": email, "exp": expire}
-    encoded_jwt = jwt.encode(to_encode, secret_key, algorithm=algorithm)
-    return encoded_jwt
+# Note: mock_firebase_auth_sdk_fixture is an autouse fixture in conftest.py
+# It yields a list containing the MagicMock for verify_id_token.
+# We can get it by adding it as an argument to the test function if needed,
+# or just use the set_mock_firebase_token helper which takes it as an argument.
 
-# Test for /auth/google/login
-@patch('backend.main.GoogleFlow') # Mock the GoogleFlow class itself
-def test_google_login_redirect(MockGoogleFlowClass, test_client: TestClient):
-    # This is the mock instance that will be returned when GoogleFlow(...) is called in main.py
-    mock_flow_instance = MockGoogleFlowClass.return_value
-    mock_flow_instance.authorization_url.return_value = ("https://accounts.google.com/o/oauth2/auth?testparams", "test_state")
-
-    response = test_client.get("/auth/google/login")
-
-    assert response.status_code == 307
-    assert "https://accounts.google.com/o/oauth2/auth?testparams" in response.headers["location"]
-    # Check that the GoogleFlow class was instantiated
-    MockGoogleFlowClass.assert_called_once()
-    # Check that authorization_url was called on the instance
-    mock_flow_instance.authorization_url.assert_called_once()
-
-def test_root_path(test_client: TestClient):
-    response = test_client.get("/")
-    assert response.status_code == 200
-    assert response.json() == {"message": "AI Tutor Backend - Enhanced"}
-
-# Test for /auth/google/callback
-@patch('backend.main.GoogleFlow') # Mock the GoogleFlow class
-@patch('backend.main.requests.get')
-def test_google_callback(mock_requests_get, MockGoogleFlowClass, test_client: TestClient, db_session):
-    # This is the mock instance that will be returned when GoogleFlow(...) is called in main.py
-    mock_flow_instance = MockGoogleFlowClass.return_value
-
-    mock_credentials_obj = MagicMock() # This object will represent flow.credentials
-    mock_credentials_obj.token = "mock_google_api_token"
-
-    # Configure fetch_token: when called, it should result in flow.credentials being set.
-    # We can achieve this by having fetch_token's side_effect modify the mock_flow_instance.
-    def fetch_token_side_effect(code):
-        mock_flow_instance.credentials = mock_credentials_obj # Simulate fetch_token setting credentials
-        return None # fetch_token itself returns None
-
-    mock_flow_instance.fetch_token.side_effect = fetch_token_side_effect
-
-    # Configure requests.get mock for Google user info
-    mock_user_info = {
-        "email": "testuser@example.com",
-        "name": "Test User",
-        "picture": "http://example.com/picture.jpg"
-    }
-    mock_requests_get.return_value.json.return_value = mock_user_info
-    mock_requests_get.return_value.raise_for_status = MagicMock()
-
-    # Make the call to the callback endpoint
-    test_code = "test_auth_code"
-    response = test_client.get(f"/auth/google/callback?code={test_code}")
-
-    assert response.status_code == 307 # Redirect to frontend
-
-    # Check if user was created/updated in DB (using db_session from conftest)
-    from backend.main import User # Import User model
-    user_in_db = db_session.query(User).filter(User.email == "testuser@example.com").first()
-    assert user_in_db is not None
-    assert user_in_db.full_name == "Test User"
-    assert user_in_db.picture_url == "http://example.com/picture.jpg"
-
-    # Assert redirect URL structure (to frontend)
-    redirect_url = response.headers["location"]
-    assert "http://localhost:3000/auth/callback" in redirect_url # Assuming FRONTEND_URL is "http://localhost:3000"
-    assert "token=" in redirect_url
-    assert "token_type=bearer" in redirect_url
-
-    # Verify mocks were called
-    mock_flow_instance.fetch_token.assert_called_with(code=test_code)
-    mock_requests_get.assert_called_once_with(
-        "https://www.googleapis.com/oauth2/v1/userinfo?alt=json",
-        headers={"Authorization": f"Bearer {mock_credentials.token}"}
+def test_get_me_unauthenticated(test_client: TestClient, mock_firebase_auth_sdk_fixture):
+    # Configure verify_id_token mock to raise InvalidIdTokenError
+    # Corrected: code is first positional arg, then message.
+    error_instance_invalid = firebase_auth_errors.InvalidIdTokenError("auth/invalid-id-token", "Test token is invalid.")
+    set_mock_firebase_token(
+        mock_firebase_auth_sdk_fixture,
+        exception_to_raise=error_instance_invalid
     )
 
-# Test for /api/auth/logout
-def test_logout_unauthenticated(test_client: TestClient):
-    response = test_client.post("/api/auth/logout")
-    # Expect 401 or 403 if not authenticated. FastAPI's Depends(oauth2_scheme) returns 401.
+    response = test_client.get("/api/users/me", headers={"Authorization": "Bearer invalidtoken"})
     assert response.status_code == 401
+    assert "Invalid Firebase ID token" in response.json()["detail"]
 
-def test_logout_authenticated(test_client: TestClient, db_session):
-    # Create a dummy user for get_current_user to find
-    from backend.main import User, JWT_SECRET_KEY, ALGORITHM
-    test_email = "logouttest@example.com"
-    user = User(email=test_email, full_name="Logout Test")
-    db_session.add(user)
-    db_session.commit()
-
-    token = create_test_access_token(test_email, JWT_SECRET_KEY, ALGORITHM)
-
-    response = test_client.post(
-        "/api/auth/logout",
-        headers={"Authorization": f"Bearer {token}"}
+def test_get_me_expired_token(test_client: TestClient, mock_firebase_auth_sdk_fixture):
+    # Corrected: code is first positional arg, then message.
+    error_instance_expired = firebase_auth_errors.ExpiredIdTokenError("auth/id-token-expired", "Test token expired.")
+    set_mock_firebase_token(
+        mock_firebase_auth_sdk_fixture,
+        exception_to_raise=error_instance_expired
     )
-    assert response.status_code == 200
-    assert response.json() == {"message": "Logout acknowledged successfully"}
-
-# Test for /api/users/me
-def test_get_me_unauthenticated(test_client: TestClient):
-    response = test_client.get("/api/users/me")
+    response = test_client.get("/api/users/me", headers={"Authorization": "Bearer expiredtoken"})
     assert response.status_code == 401
+    assert "Firebase ID token has expired" in response.json()["detail"]
 
-def test_get_me_authenticated(test_client: TestClient, db_session):
-    from backend.main import User, JWT_SECRET_KEY, ALGORITHM
-    test_email = "metest@example.com"
-    user_data = {"email": test_email, "full_name": "Me Test User", "picture_url": "http://metest.com/pic.jpg"}
+def test_get_me_new_user_creation(test_client: TestClient, db_session, mock_firebase_auth_sdk_fixture):
+    firebase_uid = "new_user_firebase_uid"
+    email = "newuser@example.com"
+    name = "New User Name"
+    picture = "http://example.com/newuser.jpg"
 
-    user = User(**user_data)
-    db_session.add(user)
-    db_session.commit()
-    db_session.refresh(user) # To get the ID
+    set_mock_firebase_token(mock_firebase_auth_sdk_fixture, {
+        "uid": firebase_uid,
+        "email": email,
+        "name": name,
+        "picture": picture,
+        "email_verified": True
+    })
 
-    token = create_test_access_token(test_email, JWT_SECRET_KEY, ALGORITHM)
+    response = test_client.get("/api/users/me", headers={"Authorization": "Bearer validtoken"})
 
-    response = test_client.get(
-        "/api/users/me",
-        headers={"Authorization": f"Bearer {token}"}
-    )
     assert response.status_code == 200
-    response_data = response.json()
-    assert response_data["email"] == user_data["email"]
-    assert response_data["full_name"] == user_data["full_name"]
-    assert response_data["picture_url"] == user_data["picture_url"]
-    assert "id" in response_data # ID is assigned by DB
-    assert response_data["id"] == user.id
+    user_data = response.json()
+    assert user_data["firebase_uid"] == firebase_uid
+    assert user_data["email"] == email
+    assert user_data["full_name"] == name
+    assert user_data["picture_url"] == picture
 
-    # Clean up user
-    db_session.delete(user)
+    # Verify user was created in the database
+    db_user = db_session.query(User).filter(User.firebase_uid == firebase_uid).first()
+    assert db_user is not None
+    assert db_user.email == email
+    assert db_user.full_name == name
+    assert db_user.id is not None # Should have an ID from DB
+
+def test_get_me_existing_user_no_update(test_client: TestClient, db_session, mock_firebase_auth_sdk_fixture):
+    firebase_uid = "existing_user_uid_no_update"
+    email = "existing_no_update@example.com"
+    name = "Existing User"
+    picture = "http://example.com/existing.jpg"
+
+    # Pre-populate user in DB
+    existing_user = User(firebase_uid=firebase_uid, email=email, full_name=name, picture_url=picture)
+    db_session.add(existing_user)
+    db_session.commit()
+    db_session.refresh(existing_user)
+    original_id = existing_user.id
+
+    set_mock_firebase_token(mock_firebase_auth_sdk_fixture, {
+        "uid": firebase_uid, "email": email, "name": name, "picture": picture, "email_verified": True
+    })
+
+    response = test_client.get("/api/users/me", headers={"Authorization": "Bearer validtoken"})
+    assert response.status_code == 200
+    user_data = response.json()
+    assert user_data["firebase_uid"] == firebase_uid
+    assert user_data["email"] == email
+    assert user_data["full_name"] == name # No change
+    assert user_data["id"] == original_id
+
+    db_user = db_session.query(User).filter(User.firebase_uid == firebase_uid).first()
+    assert db_user.full_name == name # Still original name
+
+def test_get_me_existing_user_with_update(test_client: TestClient, db_session, mock_firebase_auth_sdk_fixture):
+    firebase_uid = "existing_user_uid_with_update"
+    email = "existing_update@example.com"
+    original_name = "Original Name"
+    updated_name = "Updated Name from Firebase"
+    original_picture = "http://example.com/original.jpg"
+    updated_picture = "http://example.com/updated.jpg"
+
+    existing_user = User(firebase_uid=firebase_uid, email=email, full_name=original_name, picture_url=original_picture)
+    db_session.add(existing_user)
     db_session.commit()
 
-# (Optional) test_utils.py would test create_access_token and parts of get_current_user logic directly
-# For now, these are implicitly tested via the endpoint tests.
-# If get_current_user had more complex logic, direct unit tests would be more critical.
-# For example, testing token expiration or malformed token for get_current_user.
-pytestmark = pytest.mark.filterwarnings("ignore::DeprecationWarning") # Ignore Pydantic V1/V2 deprecation warnings for now if any
+    set_mock_firebase_token(mock_firebase_auth_sdk_fixture, {
+        "uid": firebase_uid, "email": email, "name": updated_name, "picture": updated_picture, "email_verified": True
+    })
+
+    response = test_client.get("/api/users/me", headers={"Authorization": "Bearer validtoken"})
+    assert response.status_code == 200
+    user_data = response.json()
+    assert user_data["full_name"] == updated_name
+    assert user_data["picture_url"] == updated_picture
+
+    db_user_updated = db_session.query(User).filter(User.firebase_uid == firebase_uid).first()
+    assert db_user_updated.full_name == updated_name
+    assert db_user_updated.picture_url == updated_picture
+
+def test_get_me_firebase_uid_missing_in_token(test_client: TestClient, mock_firebase_auth_sdk_fixture):
+    set_mock_firebase_token(mock_firebase_auth_sdk_fixture, {"email": "test@example.com"}) # UID missing
+    response = test_client.get("/api/users/me", headers={"Authorization": "Bearer validtoken_no_uid"})
+    assert response.status_code == 400 # As per get_current_active_user logic
+    assert "Firebase UID not found in token" in response.json()["detail"]
+
+def test_get_me_email_missing_in_token_for_new_user(test_client: TestClient, mock_firebase_auth_sdk_fixture):
+    # This test assumes the user does not exist, so creation will be attempted.
+    # User creation requires an email.
+    firebase_uid = "new_user_no_email_uid"
+    set_mock_firebase_token(mock_firebase_auth_sdk_fixture, {
+        "uid": firebase_uid, "name": "New User No Email" # Email missing
+    })
+    response = test_client.get("/api/users/me", headers={"Authorization": "Bearer validtoken_no_email"})
+    assert response.status_code == 400
+    assert "Email not found in Firebase token, cannot create user" in response.json()["detail"]
+
+# Note: The old logout tests are removed as the endpoint was removed.
+# The old custom JWT helper create_test_access_token is no longer needed.
+pytestmark = pytest.mark.filterwarnings("ignore::DeprecationWarning")

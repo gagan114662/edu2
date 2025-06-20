@@ -3,17 +3,24 @@ import { Navigate, Outlet } from 'react-router-dom';
 import { useAuth } from '../context/AuthContext';
 
 const ProtectedRoute = () => {
-    const { isAuthenticated, token } = useAuth(); // Check token as well, as isAuthenticated might have a slight delay in updating from localStorage
+    const { isAuthenticated, isLoadingAuth, user } = useAuth();
 
-    // console.log("ProtectedRoute isAuthenticated:", isAuthenticated);
-    // console.log("ProtectedRoute token:", token);
+    if (isLoadingAuth) {
+        // Optional: Render a loading spinner or some placeholder while auth state is loading
+        return (
+            <div className="flex items-center justify-center min-h-screen">
+                <div>Loading...</div>
+            </div>
+        );
+    }
 
-
-    if (!isAuthenticated && !localStorage.getItem('authToken')) { // Double check with localStorage for robustness
+    // No need to check localStorage directly anymore, as onAuthStateChanged is the source of truth.
+    // isAuthenticated is derived from the Firebase user object.
+    if (!isAuthenticated) {
         return <Navigate to="/login" replace />;
     }
 
-    return <Outlet />; // Render child routes/components
+    return <Outlet />; // Render child routes/components if authenticated
 };
 
 export default ProtectedRoute;

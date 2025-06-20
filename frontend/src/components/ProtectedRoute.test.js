@@ -1,80 +1,106 @@
 import React from 'react';
-import { render, screen } from '@testing-library/react';
-import { MemoryRouter, Routes, Route, Navigate } from 'react-router-dom';
+import { render, screen, waitFor } from '@testing-library/react';
+import { MemoryRouter, Routes, Route } from 'react-router-dom';
 import ProtectedRoute from './ProtectedRoute';
 import { useAuth } from '../context/AuthContext';
 
 // Mock AuthContext
 jest.mock('../context/AuthContext');
 
-// Mock localStorage for this test suite (ProtectedRoute checks it as a fallback)
-// jest-localstorage-mock should be globally configured via setupTests.js,
-// but clearing it here ensures a clean state for these specific tests.
-beforeEach(() => {
-    localStorage.clear();
-});
-
-
+// Dummy components for testing routes
 const TestChildComponent = () => <div data-testid="child-component">Protected Content</div>;
-const LoginPage = () => <div data-testid="login-page">Login Page</div>;
+const LoginPageForProtectedRouteTest = () => <div data-testid="login-page-for-protectedroute">Login Page</div>;
 
 describe('ProtectedRoute', () => {
-    const renderWithRouter = (authValue, initialEntry = '/protected') => {
-        useAuth.mockReturnValue(authValue); // Setup mock value for useAuth
+    beforeEach(() => {
+        useAuth.mockReset();
+        // localStorage interaction is no longer part of ProtectedRoute's core logic with Firebase AuthContext
+        localStorage.clear();
+    });
 
-        // Clear localStorage for each specific scenario unless specified
-        if (!authValue.token && !authValue.isAuthenticated) { // if unauth, ensure no lingering token
-             localStorage.removeItem('authToken');
-        } else if (authValue.token) {
-             localStorage.setItem('authToken', authValue.token);
-        }
-
-
+    const renderProtectedRoute = (authContextValue, initialEntry = '/protected') => {
+        useAuth.mockReturnValue(authContextValue);
         render(
             <MemoryRouter initialEntries={[initialEntry]}>
                 <Routes>
                     <Route element={<ProtectedRoute />}>
                         <Route path="/protected" element={<TestChildComponent />} />
                     </Route>
-                    <Route path="/login" element={<LoginPage />} />
+                    <Route path="/login" element={<LoginPageForProtectedRouteTest />} />
                 </Routes>
             </MemoryRouter>
         );
     };
 
-    test('renders child component if authenticated (via context)', () => {
-        renderWithRouter({ isAuthenticated: true, token: 'fake-token' });
-        expect(screen.getByTestId('child-component')).toBeInTheDocument();
-        expect(screen.queryByTestId('login-page')).not.toBeInTheDocument();
-    });
-
-    test('redirects to login if not authenticated (via context)', () => {
-        renderWithRouter({ isAuthenticated: false, token: null });
+    test('displays loading indicator when isLoadingAuth is true', () => {
+        renderProtectedRoute({ isAuthenticated: false, user: null, isLoadingAuth: true });
+        // ProtectedRoute renders a "Loading..." div
+        expect(screen.getByText(/Loading.../i)).toBeInTheDocument();
         expect(screen.queryByTestId('child-component')).not.toBeInTheDocument();
-        expect(screen.getByTestId('login-page')).toBeInTheDocument(); // Check that we landed on login
+        expect(screen.queryByTestId('login-page-for-protectedroute')).not.toBeInTheDocument();
     });
 
-    test('renders child component if not authenticated by context but token exists in localStorage', () => {
-        // This tests the fallback check in ProtectedRoute for robustness,
-        // though ideally context and localStorage are in sync.
-        localStorage.setItem('authToken', 'fallback-token');
-        renderWithRouter({ isAuthenticated: false, token: null }); // Context says not auth
-
-        // The ProtectedRoute currently prioritizes context. If context says false, it redirects.
-        // To make it render child if localStorage token exists even if context is false (e.g. context not yet updated),
-        // ProtectedRoute logic would need to be: if (context.isAuth || localStorage.getItem('authToken'))
-        // Current logic: if (!isAuthenticated && !localStorage.getItem('authToken')) then redirect.
-        // So, if isAuthenticated is false, but localStorage has token, it will still render child. Let's test that.
-        // The provided ProtectedRoute code is: `if (!isAuthenticated && !localStorage.getItem('authToken')) { return <Navigate to="/login" replace />; }`
-        // This means if EITHER isAuthenticated is true OR localStorage has a token, it should render Outlet.
-        // So if context.isAuthenticated is false, but localStorage has a token, it should STILL render the child.
-        expect(screen.getByTestId('child-component')).toBeInTheDocument();
+    test('renders child component if authenticated and not loading', async () => {
+        renderProtectedRoute({ isAuthenticated: true, user: { uid: 'test-uid' }, isLoadingAuth: false });
+        // Wait for any potential async updates if ProtectedRoute had them (though it's sync after isLoadingAuth is false)
+        await waitFor(() => {
+            expect(screen.getByTestId('child-component')).toBeInTheDocument();
+        });
+        expect(screen.queryByTestId('login-page-for-protectedroute')).not.toBeInTheDocument();
     });
 
-    test('redirects to login if not authenticated by context AND no token in localStorage', () => {
-        localStorage.removeItem('authToken'); // Ensure no fallback token
-        renderWithRouter({ isAuthenticated: false, token: null });
+    test('redirects to login if not authenticated and not loading', async () => {
+        renderProtectedRoute({ isAuthenticated: false, user: null, isLoadingAuth: false });
+        // The Navigate component will cause a re-render, wait for it.
+        await waitFor(() => {
+            expect(screen.getByTestId('login-page-for-protectedroute')).toBeInTheDocument();
+        });
         expect(screen.queryByTestId('child-component')).not.toBeInTheDocument();
-        expect(screen.getByTestId('login-page')).toBeInTheDocument();
+    });
+
+    test('handles initial loading state then authenticated', async () => {
+        const mockUseAuth = jest.fn()
+            .mockReturnValueOnce({ isAuthenticated: false, user: null, isLoadingAuth: true }) // Initial call: loading
+            .mockReturnValueOnce({ isAuthenticated: true, user: { uid: 'test-uid' }, isLoadingAuth: false }); // Second call (after state update): authenticated
+        useAuth.mockImplementation(mockUseAuth);
+
+        const { rerender } = render(
+            <MemoryRouter initialEntries={['/protected']}>
+                <Routes>
+                    <Route element={<ProtectedRoute />}>
+                        <Route path="/protected" element={<TestChildComponent />} />
+                    </Route>
+                    <Route path="/login" element={<LoginPageForProtectedRouteTest />} />
+                </Routes>
+            </MemoryRouter>
+        );
+
+        expect(screen.getByText(/Loading.../i)).toBeInTheDocument();
+
+        // Simulate AuthContext updating after Firebase load
+        // Rerender with new context value (or rely on AuthProvider to do this if not mocking useAuth directly)
+        // Since useAuth is directly mocked, a simple rerender with changed mock value might not trigger it right.
+        // Instead, we'll assume the component re-renders due to context change.
+        // For this test, we can simulate the context provider re-rendering its children.
+        // This is tricky with direct useAuth mock. A better way is to wrap with real AuthProvider and use setMockUser.
+        // However, sticking to useAuth mock:
+
+        // This re-render simulates the parent (AuthProvider) re-rendering ProtectedRoute
+        // after the isLoadingAuth changes.
+        rerender(
+             <MemoryRouter initialEntries={['/protected']}>
+                <Routes>
+                    <Route element={<ProtectedRoute />}>
+                        <Route path="/protected" element={<TestChildComponent />} />
+                    </Route>
+                    <Route path="/login" element={<LoginPageForProtectedRouteTest />} />
+                </Routes>
+            </MemoryRouter>
+        );
+
+        await waitFor(() => {
+            expect(screen.getByTestId('child-component')).toBeInTheDocument();
+        });
+        expect(screen.queryByText(/Loading.../i)).not.toBeInTheDocument();
     });
 });

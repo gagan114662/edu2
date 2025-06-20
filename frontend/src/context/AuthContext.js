@@ -1,96 +1,72 @@
-import React, { createContext, useState, useContext, useEffect } from 'react';
-import axios from 'axios'; // Import axios
+import React, { createContext, useContext, useEffect, useState } from 'react';
+import { onAuthStateChanged, signOut as firebaseSignOut } from 'firebase/auth';
+import { auth } from '../firebaseConfig'; // Adjust path if needed
 
-const AuthContext = createContext(null);
+const AuthContext = createContext(undefined);
 
 export const AuthProvider = ({ children }) => {
-    const [token, setToken] = useState(localStorage.getItem('authToken'));
-    const [user, setUser] = useState(JSON.parse(localStorage.getItem('authUser')));
-    const [isAuthenticated, setIsAuthenticated] = useState(!!token);
+  const [user, setUser] = useState(null); // Will store Firebase user object
+  const [isLoadingAuth, setIsLoadingAuth] = useState(true);
 
-    useEffect(() => {
-        if (token) {
-            localStorage.setItem('authToken', token);
-            setIsAuthenticated(true);
-            if (user) {
-                localStorage.setItem('authUser', JSON.stringify(user));
-            } else {
-                // If there's a token but no user object, try to parse from token
-                // This might happen on initial load from localStorage if user wasn't stored separately
-                // or if login only provided a token.
-                try {
-                    const payload = JSON.parse(atob(token.split('.')[1]));
-                    const initialUser = {
-                        email: payload.sub,
-                        name: payload.name || 'User',
-                        picture_url: payload.picture || null
-                    };
-                    setUser(initialUser);
-                    localStorage.setItem('authUser', JSON.stringify(initialUser));
-                } catch (e) {
-                    console.warn("Could not parse user info from token on initial load:", e);
-                }
-            }
-        } else {
-            localStorage.removeItem('authToken');
-            localStorage.removeItem('authUser');
-            setIsAuthenticated(false);
-            setUser(null);
+  useEffect(() => {
+    const unsubscribe = onAuthStateChanged(auth, (firebaseUser) => {
+      setUser(firebaseUser);
+      setIsLoadingAuth(false);
+      // No need to manage localStorage for token here, Firebase SDK handles it.
+      // If you were storing user profile info separately in localStorage, you might update it here.
+      if (firebaseUser) {
+        localStorage.setItem('authUserDisplayName', firebaseUser.displayName || 'User');
+      } else {
+        localStorage.removeItem('authUserDisplayName');
+      }
+    });
+    return () => unsubscribe(); // Cleanup subscription on unmount
+  }, []);
+
+  const logout = async () => {
+    setIsLoadingAuth(true); // Optional: set loading true during logout process
+    try {
+      await firebaseSignOut(auth);
+      // setUser(null) will be handled by onAuthStateChanged
+      // setIsLoadingAuth(false) will also be handled by onAuthStateChanged
+    } catch (error) {
+      console.error("Error signing out: ", error);
+      setIsLoadingAuth(false); // Ensure loading is false if error occurs
+    }
+  };
+
+  // Function to get ID token for backend API calls
+  const getIdToken = async () => {
+    if (user) {
+      try {
+        return await user.getIdToken(true); // Pass true to force refresh if needed
+      } catch (error) {
+        console.error("Error getting ID token: ", error);
+        // Could potentially trigger logout or re-authentication if token is invalid/expired
+        if (error.code === 'auth/user-token-expired' || error.code === 'auth/invalid-user-token') {
+            await logout(); // Log out user if token is invalid
         }
-    }, [token]); // Removed `user` from dependency array to avoid re-saving stringified user on every user change. User saving is handled by login or this effect when token changes.
+        return null;
+      }
+    }
+    return null;
+  };
 
-    const login = (newToken, userData) => {
-        setToken(newToken); // This will trigger the useEffect
-        if (userData) {
-            setUser(userData);
-            localStorage.setItem('authUser', JSON.stringify(userData)); // Explicitly save user on login
-        } else {
-            // If no explicit user data, try to parse from token as a fallback
-             try {
-                const payload = JSON.parse(atob(newToken.split('.')[1]));
-                const parsedUser = {
-                    email: payload.sub,
-                    name: payload.name || 'User',
-                    picture_url: payload.picture || null
-                };
-                setUser(parsedUser);
-                localStorage.setItem('authUser', JSON.stringify(parsedUser));
-            } catch (e) {
-                console.warn("Could not parse user info from token during login:", e);
-                setUser(null); // Ensure user state is cleared if parsing fails
-                localStorage.removeItem('authUser');
-            }
-        }
-    };
+  const value = {
+    user, // Firebase user object
+    isAuthenticated: !!user, // True if user object is not null
+    isLoadingAuth,
+    logout, // Firebase logout
+    getIdToken // Function to get Firebase ID token
+  };
 
-    const logout = async () => {
-        if (token) {
-            try {
-                await axios.post('http://localhost:8000/api/auth/logout', {}, {
-                    headers: {
-                        'Authorization': `Bearer ${token}`
-                    }
-                });
-                console.log('Logout request to backend successful.');
-            } catch (error) {
-                console.error('Logout request to backend failed:', error);
-                // Proceed with frontend logout regardless of backend call success
-            }
-        }
-        setToken(null); // This will trigger the useEffect to clear localStorage and isAuthenticated
-    };
-
-    return (
-        <AuthContext.Provider value={{ token, user, isAuthenticated, login, logout }}>
-            {children}
-        </AuthContext.Provider>
-    );
+  return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;
 };
 
 export const useAuth = () => {
-    const context = useContext(AuthContext);
-    if (context === undefined) {
-        throw new Error('useAuth must be used within an AuthProvider');
-    }
-    return context;
+  const context = useContext(AuthContext);
+  if (context === undefined) {
+    throw new Error('useAuth must be used within an AuthProvider');
+  }
+  return context;
 };
