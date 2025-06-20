@@ -57,6 +57,7 @@ def test_get_me_new_user_creation(test_client: TestClient, db_session, mock_fire
     assert user_data["email"] == email
     assert user_data["full_name"] == name
     assert user_data["picture_url"] == picture
+    assert user_data["role"] == "student"
 
     # Verify user was created in the database
     db_user = db_session.query(User).filter(User.firebase_uid == firebase_uid).first()
@@ -64,15 +65,17 @@ def test_get_me_new_user_creation(test_client: TestClient, db_session, mock_fire
     assert db_user.email == email
     assert db_user.full_name == name
     assert db_user.id is not None # Should have an ID from DB
+    assert db_user.role == "student"
 
 def test_get_me_existing_user_no_update(test_client: TestClient, db_session, mock_firebase_auth_sdk_fixture):
     firebase_uid = "existing_user_uid_no_update"
     email = "existing_no_update@example.com"
     name = "Existing User"
     picture = "http://example.com/existing.jpg"
+    role = "student" # Or 'parent' as suggested, 'student' for consistency with default
 
     # Pre-populate user in DB
-    existing_user = User(firebase_uid=firebase_uid, email=email, full_name=name, picture_url=picture)
+    existing_user = User(firebase_uid=firebase_uid, email=email, full_name=name, picture_url=picture, role=role)
     db_session.add(existing_user)
     db_session.commit()
     db_session.refresh(existing_user)
@@ -89,6 +92,7 @@ def test_get_me_existing_user_no_update(test_client: TestClient, db_session, moc
     assert user_data["email"] == email
     assert user_data["full_name"] == name # No change
     assert user_data["id"] == original_id
+    assert user_data["role"] == role
 
     db_user = db_session.query(User).filter(User.firebase_uid == firebase_uid).first()
     assert db_user.full_name == name # Still original name
@@ -100,8 +104,9 @@ def test_get_me_existing_user_with_update(test_client: TestClient, db_session, m
     updated_name = "Updated Name from Firebase"
     original_picture = "http://example.com/original.jpg"
     updated_picture = "http://example.com/updated.jpg"
+    user_role = "student" # Role for the existing user
 
-    existing_user = User(firebase_uid=firebase_uid, email=email, full_name=original_name, picture_url=original_picture)
+    existing_user = User(firebase_uid=firebase_uid, email=email, full_name=original_name, picture_url=original_picture, role=user_role)
     db_session.add(existing_user)
     db_session.commit()
 
@@ -114,10 +119,12 @@ def test_get_me_existing_user_with_update(test_client: TestClient, db_session, m
     user_data = response.json()
     assert user_data["full_name"] == updated_name
     assert user_data["picture_url"] == updated_picture
+    assert user_data["role"] == user_role # Role should not change
 
     db_user_updated = db_session.query(User).filter(User.firebase_uid == firebase_uid).first()
     assert db_user_updated.full_name == updated_name
     assert db_user_updated.picture_url == updated_picture
+    assert db_user_updated.role == user_role # Role should remain unchanged in DB
 
 def test_get_me_firebase_uid_missing_in_token(test_client: TestClient, mock_firebase_auth_sdk_fixture):
     set_mock_firebase_token(mock_firebase_auth_sdk_fixture, {"email": "test@example.com"}) # UID missing
