@@ -15,12 +15,14 @@ from fastapi.security import OAuth2PasswordBearer
 # from fastapi import Request as FastAPIRequest # No longer needed for state cookie
 # from starlette.responses import Response as StarletteResponse # No longer needed for state cookie
 from dotenv import load_dotenv
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
+from typing import Optional, Dict, Any, Literal as LiteralType # Added Literal
+from datetime import datetime # Ensure this specific import is present
+
 # from itsdangerous import URLSafeTimedSerializer # No longer used
 
 import firebase_admin
-from firebase_admin import credentials as firebase_credentials, auth as firebase_auth
-
+from firebase_admin import credentials as firebase_credentials, auth as firebase_auth, firestore # Added firestore
 import asyncio
 import aiohttp
 from fastapi import WebSocket, WebSocketDisconnect
@@ -201,6 +203,53 @@ async def read_users_me(current_user: User = Depends(get_current_active_user)):
 # Existing /api/users/me needs to be adapted to fetch User from DB using firebase_uid.
 # This will be part of "Adapt User Profile Management".
 
+
+# --- Firestore Setup ---
+# Global variable for Firestore client instance
+_db_firestore_client_instance = None
+
+def get_firestore_db():
+    global _db_firestore_client_instance
+    if _db_firestore_client_instance is None:
+        try:
+            if not firebase_admin._DEFAULT_APP_NAME in firebase_admin._apps: # Check if default app is initialized
+                print("CRITICAL: Firebase Admin default app not initialized when get_firestore_db was called.")
+                # This case should ideally not happen if startup initialization is robust.
+                # Re-attempting init here might be an option, or ensure prior init.
+                # For now, let it proceed to firestore.client() which will likely use the auto-init if possible or fail.
+            _db_firestore_client_instance = firestore.client()
+            print("Firestore client initialized via get_firestore_db().")
+        except Exception as e:
+            print(f"CRITICAL: Failed to initialize Firestore client in get_firestore_db: {e}")
+            raise HTTPException(status_code=503, detail="Firestore service is not available due to initialization error.")
+    return _db_firestore_client_instance
+
+# Pydantic Models for Progress Logging
+class LogEventRequest(BaseModel):
+    event_type: LiteralType['SESSION_START', 'SESSION_END', 'QUESTION_ANSWERED']
+    event_data: Optional[Dict[str, Any]] = None
+    timestamp_client: Optional[datetime] = None
+
+# Pydantic Models for User Progress Response
+class TopicProgress(BaseModel):
+    questionsAttempted: int = 0
+    questionsCorrect: int = 0
+    masteryLevel: float = 0.0
+    lastPracticed: Optional[datetime] = None
+
+class UserProgressResponse(BaseModel):
+    userId: str # This will be the firebase_uid
+    email: Optional[str] = None
+    totalSessions: int = 0
+    totalTimeSpentSeconds: int = 0
+    lastActivityTimestamp: Optional[datetime] = None
+    createdAt: Optional[datetime] = None
+    topics: Dict[str, TopicProgress] = {}
+
+    class Config:
+        from_attributes = True
+
+
 # Gemini WebSocket Proxy Configuration
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 GEMINI_LIVE_API_ENDPOINT_URL = os.getenv("GEMINI_LIVE_API_ENDPOINT_URL") # Example: "wss://speech.googleapis.com/v2/streaming/voice" (this is a guess)
@@ -340,3 +389,228 @@ async def websocket_voice_tutor_endpoint(client_ws: WebSocket):
                 except Exception as e_close:
                     print(f"Error closing client WebSocket: {e_close}")
             print("WebSocket proxy endpoint finished.")
+
+
+# --- Progress Logging Endpoint ---
+@app.post("/api/progress/log_event", tags=["Progress"])
+async def log_progress_event(
+    event_request: LogEventRequest,
+    current_user: User = Depends(get_current_active_user), # User is SQLAlchemy model
+    db_fs: firestore.Client = Depends(get_firestore_db)
+):
+    firebase_uid = current_user.firebase_uid
+    user_progress_collection_ref = db_fs.collection("UserProgress")
+    user_progress_doc_ref = user_progress_collection_ref.document(firebase_uid)
+
+    event_type = event_request.event_type
+    # event_data = event_request.event_data # To be used in Phase 2
+    server_timestamp = datetime.utcnow()
+
+    try:
+        doc_snapshot = user_progress_doc_ref.get()
+        initial_doc_data = {
+            'userId': firebase_uid,
+            'email': current_user.email, # Log email from User model
+            'createdAt': server_timestamp,
+            'lastActivityTimestamp': server_timestamp,
+            'totalSessions': 0,
+            'totalTimeSpentSeconds': 0,
+            'topics': {}
+        }
+
+        # --- SESSION_START ---
+        if event_type == "SESSION_START":
+            if not doc_snapshot.exists:
+                 user_progress_doc_ref.set({
+                    'userId': firebase_uid,
+                    'email': current_user.email,
+                    'lastActivityTimestamp': server_timestamp,
+                    'createdAt': server_timestamp,
+                    'totalSessions': 1,
+                    'totalTimeSpentSeconds': 0,
+                    'topics': {}
+                })
+            else:
+                user_progress_doc_ref.update({
+                    'lastActivityTimestamp': server_timestamp,
+                    'totalSessions': firestore.Increment(1)
+                })
+            message = f"Logged SESSION_START for user {firebase_uid}"
+
+        # --- SESSION_END ---
+        elif event_type == "SESSION_END":
+            duration_seconds = 0
+            if event_request.event_data and "sessionDurationSeconds" in event_request.event_data:
+                try:
+                    duration_seconds = int(event_request.event_data["sessionDurationSeconds"])
+                except ValueError:
+                    raise HTTPException(status_code=400, detail="Invalid sessionDurationSeconds format.")
+
+            update_data = {
+                'lastActivityTimestamp': server_timestamp,
+                'totalTimeSpentSeconds': firestore.Increment(duration_seconds)
+            }
+            if not doc_snapshot.exists:
+                initial_doc_data['totalTimeSpentSeconds'] = duration_seconds
+                initial_doc_data['lastActivityTimestamp'] = server_timestamp
+                initial_doc_data['totalSessions'] = 1 # If session_end is first, assume 1 session
+                user_progress_doc_ref.set(initial_doc_data)
+                message = f"UserProgress doc created and SESSION_END logged for user {firebase_uid}, duration: {duration_seconds}s."
+            else:
+                user_progress_doc_ref.update(update_data)
+                message = f"Logged SESSION_END for user {firebase_uid}, duration: {duration_seconds}s."
+            print(message)
+
+        # --- QUESTION_ANSWERED ---
+        elif event_type == "QUESTION_ANSWERED":
+            if not event_request.event_data:
+                raise HTTPException(status_code=400, detail="event_data is required for QUESTION_ANSWERED.")
+
+            topic_name_raw = event_request.event_data.get("topicName")
+            is_correct = event_request.event_data.get("isCorrect")
+
+            if not topic_name_raw or not isinstance(topic_name_raw, str) or topic_name_raw.strip() == "":
+                raise HTTPException(status_code=400, detail="Invalid or missing topicName (string) in event_data for QUESTION_ANSWERED.")
+            if is_correct is None or not isinstance(is_correct, bool):
+                raise HTTPException(status_code=400, detail="Invalid or missing isCorrect (boolean) in event_data for QUESTION_ANSWERED.")
+
+            topic_name_sanitized = topic_name_raw.replace(".", "_").strip() # Sanitize and strip
+
+            # Define the transaction function
+            @firestore.transactional
+            def update_topic_stats_in_transaction(transaction, doc_ref_to_update, uid_of_user, user_email_from_auth, topic_name_to_update, correct_answer_bool, current_server_timestamp):
+                doc_snap = doc_ref_to_update.get(transaction=transaction)
+
+                user_data_dict = {}
+                if not doc_snap.exists:
+                    # Initialize base document structure if it doesn't exist
+                    user_data_dict = {
+                        'userId': uid_of_user,
+                        'email': user_email_from_auth, # Log email on creation
+                        'createdAt': current_server_timestamp,
+                        'lastActivityTimestamp': current_server_timestamp,
+                        'totalSessions': 1, # Assume first event implies a session
+                        'totalTimeSpentSeconds': 0,
+                        'topics': {}
+                    }
+                else:
+                    user_data_dict = doc_snap.to_dict()
+                    if 'email' not in user_data_dict and user_email_from_auth: # Ensure email is present
+                        user_data_dict['email'] = user_email_from_auth
+                    if 'totalSessions' not in user_data_dict: # Ensure totalSessions is present
+                        user_data_dict['totalSessions'] = 0 # Or 1 if this event implies a new session
+
+
+                if 'topics' not in user_data_dict or user_data_dict['topics'] is None: # Ensure 'topics' map exists
+                    user_data_dict['topics'] = {}
+
+                current_topic_data = user_data_dict.get('topics', {}).get(topic_name_to_update, {
+                    'questionsAttempted': 0,
+                    'questionsCorrect': 0,
+                    'masteryLevel': 0.0, # Initialize masteryLevel
+                })
+
+                new_attempted = current_topic_data['questionsAttempted'] + 1
+                new_correct = current_topic_data['questionsCorrect'] + (1 if correct_answer_bool else 0)
+
+                mastery_calculated = 0.0
+                if new_attempted > 0:
+                    mastery_calculated = round(new_correct / new_attempted, 3)
+
+                user_data_dict['topics'][topic_name_to_update] = {
+                    'questionsAttempted': new_attempted,
+                    'questionsCorrect': new_correct,
+                    'masteryLevel': mastery_calculated,
+                    'lastPracticed': current_server_timestamp
+                }
+                user_data_dict['lastActivityTimestamp'] = current_server_timestamp
+
+                if not doc_snap.exists:
+                    transaction.set(doc_ref_to_update, user_data_dict)
+                else:
+                    # Atomically update only the necessary fields
+                    update_payload = {
+                        f'topics.{topic_name_to_update}': user_data_dict['topics'][topic_name_to_update],
+                        'lastActivityTimestamp': current_server_timestamp
+                    }
+                    if 'email' not in doc_snap.to_dict() and user_email_from_auth:
+                         update_payload['email'] = user_email_from_auth
+                    # If totalSessions was 0 and this is the first question, it implies a session started.
+                    if doc_snap.to_dict().get('totalSessions', 0) == 0:
+                        update_payload['totalSessions'] = 1
+
+                    transaction.update(doc_ref_to_update, update_payload)
+
+                return new_attempted, new_correct, mastery_calculated
+
+            # Execute the transaction
+            transaction_instance = db_fs.transaction()
+            attempted_count, correct_answered_count, calculated_mastery_level = update_topic_stats_in_transaction(
+                transaction_instance,
+                user_progress_doc_ref,
+                firebase_uid,
+                current_user.email,
+                topic_name_sanitized,
+                is_correct,
+                server_timestamp
+            )
+
+            message = (f"Logged QUESTION_ANSWERED for user {firebase_uid}, topic: '{topic_name_sanitized}'. "
+                       f"Correct: {is_correct}. New Stats: Attempted={attempted_count}, Correct={correct_answered_count}. "
+                       f"Mastery: {calculated_mastery_level:.3f}")
+            print(message)
+
+        # --- Fallback for other/undefined event types (maintains lastActivityTimestamp) ---
+        else: # Should not be reached if LiteralType in Pydantic model is exhaustive
+            # This block should ideally not be reached if LiteralType for event_type is exhaustive
+            # and client sends valid event_types.
+            # If it's reached, it means an unknown event_type was sent.
+            print(f"Warning: Received unknown event_type '{event_type}' for user {firebase_uid}.")
+            update_data = {'lastActivityTimestamp': server_timestamp}
+            if not doc_snapshot.exists:
+                initial_doc_data.update(update_data)
+                user_progress_doc_ref.set(initial_doc_data)
+                message = f"UserProgress doc created and event '{event_type}' logged (updated lastActivity) for user {firebase_uid}."
+            else:
+                user_progress_doc_ref.update(update_data)
+                message = f"Event '{event_type}' logged (updated lastActivity) for user {firebase_uid}."
+            print(message)
+
+        return {"status": "success", "message": message}
+
+    except Exception as e:
+        print(f"Error processing event {event_type} for user {firebase_uid}: {e}")
+        # Consider more specific error logging in production
+        raise HTTPException(status_code=500, detail=f"Error processing progress event: {str(e)}")
+
+
+# --- Endpoint to Fetch User Progress ---
+@app.get("/api/progress/me", response_model=UserProgressResponse, tags=["Progress"])
+async def get_user_progress(
+    current_user: User = Depends(get_current_active_user), # User is SQLAlchemy model
+    db_fs: firestore.Client = Depends(get_firestore_db)
+):
+    firebase_uid = current_user.firebase_uid
+    user_progress_doc_ref = db_fs.collection("UserProgress").document(firebase_uid)
+
+    try:
+        doc_snapshot = user_progress_doc_ref.get()
+
+        if doc_snapshot.exists:
+            progress_data = doc_snapshot.to_dict()
+            # Pydantic will use default values from the model if fields are missing
+            # and they have defaults in the model.
+            # Ensure userId is correctly mapped if Firestore field is different from Pydantic model.
+            # If firestore 'userId' field is firebase_uid, this is fine.
+            # Our UserProgressResponse model has 'userId', and we populate it with firebase_uid.
+            return UserProgressResponse(**progress_data)
+        else:
+            # No progress document found, return a default empty state
+            return UserProgressResponse(
+                userId=firebase_uid,
+                email=current_user.email, # Get email from the auth user
+                # Other fields will use Pydantic model defaults (0, {}, etc.)
+            )
+    except Exception as e:
+        print(f"Error fetching progress for user {firebase_uid}: {e}")
+        raise HTTPException(status_code=500, detail=f"Error fetching progress data: {str(e)}")

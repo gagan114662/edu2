@@ -4,6 +4,7 @@ import LoginPage from './pages/LoginPage';
 import HomePage from './pages/HomePage';
 // AuthCallbackPage is removed
 import ProtectedRoute from './components/ProtectedRoute';
+import ProgressDashboardPage from './pages/ProgressDashboardPage'; // Import the new page
 import './App.css';
 
 function App() {
@@ -17,6 +18,7 @@ function App() {
         {/* Protected Routes: */}
         <Route element={<ProtectedRoute />}>
           <Route path="/" element={<HomePage />} />
+          <Route path="/dashboard" element={<ProgressDashboardPage />} /> {/* Add new dashboard route */}
           {/* Add other protected routes here as children of ProtectedRoute */}
         </Route>
 
