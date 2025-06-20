@@ -21,6 +21,10 @@ from pydantic import BaseModel
 import firebase_admin
 from firebase_admin import credentials as firebase_credentials, auth as firebase_auth
 
+import asyncio
+import aiohttp
+from fastapi import WebSocket, WebSocketDisconnect
+
 load_dotenv()
 
 # Environment Variables
@@ -196,3 +200,143 @@ async def read_users_me(current_user: User = Depends(get_current_active_user)):
 # The UserResponse model should also reflect this.
 # Existing /api/users/me needs to be adapted to fetch User from DB using firebase_uid.
 # This will be part of "Adapt User Profile Management".
+
+# Gemini WebSocket Proxy Configuration
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+GEMINI_LIVE_API_ENDPOINT_URL = os.getenv("GEMINI_LIVE_API_ENDPOINT_URL") # Example: "wss://speech.googleapis.com/v2/streaming/voice" (this is a guess)
+
+
+async def client_to_gemini_task(client_ws: WebSocket, gemini_ws: aiohttp.ClientWebSocketResponse):
+    try:
+        while True:
+            data = await client_ws.receive_bytes()
+            if data:
+                await gemini_ws.send_bytes(data)
+            # Consider handling text messages if client sends config as text:
+            # text_data = await client_ws.receive_text()
+            # await gemini_ws.send_str(text_data)
+    except WebSocketDisconnect:
+        print("Client disconnected from proxy while sending to Gemini.")
+        # Ensure Gemini connection is closed if client disconnects abruptly
+        if not gemini_ws.closed:
+            await gemini_ws.close(code=aiohttp.WSCloseCode.GOING_AWAY, message=b'Client disconnected')
+    except Exception as e:
+        print(f"Error in client_to_gemini_task: {e}")
+        if not gemini_ws.closed:
+            await gemini_ws.close(code=aiohttp.WSCloseCode.INTERNAL_ERROR, message=b'Proxy error')
+
+
+async def gemini_to_client_task(client_ws: WebSocket, gemini_ws: aiohttp.ClientWebSocketResponse):
+    try:
+        async for msg in gemini_ws:
+            if client_ws.client_state == client_ws.client_state.DISCONNECTED:
+                print("Client already disconnected, stopping gemini_to_client_task.")
+                break
+
+            if msg.type == aiohttp.WSMsgType.TEXT:
+                await client_ws.send_text(msg.data)
+            elif msg.type == aiohttp.WSMsgType.BINARY:
+                await client_ws.send_bytes(msg.data)
+            elif msg.type == aiohttp.WSMsgType.CLOSED:
+                print("Gemini WS connection closed by remote.")
+                # Propagate close to client if Gemini closes first
+                if not client_ws.client_state == client_ws.client_state.DISCONNECTED:
+                    await client_ws.close(code=gemini_ws.close_code or 1000)
+                break
+            elif msg.type == aiohttp.WSMsgType.ERROR:
+                print(f"Gemini WS connection error: {gemini_ws.exception()}")
+                if not client_ws.client_state == client_ws.client_state.DISCONNECTED:
+                    await client_ws.close(code=gemini_ws.close_code or 1005) # 1005: No Status Rcvd (generic)
+                break
+    except WebSocketDisconnect: # This can happen if client_ws.close() is called by the other task
+        print("Client disconnected during gemini_to_client_task.")
+    except Exception as e:
+        print(f"Error in gemini_to_client_task: {e}")
+        if not client_ws.client_state == client_ws.client_state.DISCONNECTED:
+            try:
+                await client_ws.close(code=1011) # Internal error
+            except Exception: # Ignore errors during close
+                pass
+
+
+@app.websocket("/ws/voice_tutor")
+async def websocket_voice_tutor_endpoint(client_ws: WebSocket):
+    await client_ws.accept()
+    print("Client WebSocket connected to /ws/voice_tutor.")
+
+    if not GEMINI_API_KEY or not GEMINI_LIVE_API_ENDPOINT_URL:
+        error_msg = "Backend not configured for Gemini Live API."
+        print(f"Closing WebSocket connection: {error_msg}")
+        await client_ws.send_json({"type": "error", "message": error_msg}) # Send JSON for structured error
+        await client_ws.close(code=1008) # Policy Violation
+        return
+
+    async with aiohttp.ClientSession() as session:
+        gemini_ws_conn = None
+        try:
+            print(f"Attempting to connect to Gemini Live API at {GEMINI_LIVE_API_ENDPOINT_URL}")
+            # Actual headers will depend on Gemini API docs. This is a placeholder.
+            # Common practice: "Authorization": f"Bearer {GEMINI_API_KEY}" or "X-Goog-Api-Key": GEMINI_API_KEY
+            headers = {"Authorization": f"Bearer {GEMINI_API_KEY}"}
+
+            gemini_ws_conn = await session.ws_connect(
+                GEMINI_LIVE_API_ENDPOINT_URL,
+                headers=headers,
+                # Add other relevant params like protocols, heartbeat, etc.
+            )
+            print("Successfully connected to Gemini Live API WebSocket.")
+
+            # Run both tasks concurrently
+            # Ensure that if one task finishes (e.g., due to disconnect or error), the other is cancelled.
+            receive_task = asyncio.create_task(client_to_gemini_task(client_ws, gemini_ws_conn))
+            send_task = asyncio.create_task(gemini_to_client_task(client_ws, gemini_ws_conn))
+
+            done, pending = await asyncio.wait(
+                [receive_task, send_task],
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+
+            for task in pending:
+                print(f"Cancelling pending task: {task}")
+                task.cancel()
+
+            # Await done tasks to raise exceptions if any occurred within them
+            for task in done:
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    print(f"Task {task} was cancelled.")
+                except Exception as e:
+                    print(f"Task {task} raised an exception: {e}")
+
+        except aiohttp.ClientConnectorError as e:
+            error_msg = "Failed to connect to AI voice service (connector error)."
+            print(f"{error_msg} Details: {e}")
+            await client_ws.send_json({"type": "error", "message": error_msg})
+        except aiohttp.WSServerHandshakeError as e:
+            error_msg = f"Failed to connect to AI voice service (handshake error: {e.status}, {e.message}). Check API Key and Endpoint URL."
+            print(f"{error_msg} Details: {e}")
+            await client_ws.send_json({"type": "error", "message": error_msg})
+        except Exception as e:
+            error_msg = "An unexpected error occurred with the voice service proxy."
+            print(f"{error_msg} Details: {e}")
+            # Check if this is an asyncio.CancelledError from the main task itself
+            if not isinstance(e, asyncio.CancelledError):
+                 try:
+                    await client_ws.send_json({"type": "error", "message": error_msg})
+                 except Exception: # If sending fails, client is likely gone
+                    pass
+        finally:
+            print("Ensuring WebSocket connections are closed.")
+            if gemini_ws_conn and not gemini_ws_conn.closed:
+                print("Closing Gemini WebSocket connection.")
+                await gemini_ws_conn.close()
+
+            # Check client_ws state before attempting to close
+            if client_ws.client_state != client_ws.client_state.DISCONNECTED:
+                print("Closing client WebSocket connection.")
+                try:
+                    await client_ws.close()
+                except Exception as e_close:
+                    print(f"Error closing client WebSocket: {e_close}")
+            print("WebSocket proxy endpoint finished.")

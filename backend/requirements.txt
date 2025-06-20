@@ -10,6 +10,7 @@ psycopg2-binary
 SQLAlchemy
 python-dotenv
 firebase-admin
+aiohttp # For WebSocket client to Gemini
 # Testing dependencies
 pytest
 httpx
