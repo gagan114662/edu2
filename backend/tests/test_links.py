@@ -3,6 +3,7 @@ from fastapi.testclient import TestClient
 from sqlalchemy.orm import Session
 from typing import List
 from unittest.mock import patch, MagicMock
+import os # <--- Import os
 from datetime import datetime, timedelta, timezone
 
 from backend.main import User, ParentChildLink, UserResponse, ChildDashboardData # UserResponse might be useful for checking user details
@@ -188,6 +189,112 @@ def test_link_parent_child_error_unauthenticated(
     )
     assert response.status_code == 401
 
+
+# Tests for PDF Report Endpoint
+@patch('backend.main.firestore.client')
+def test_get_child_progress_report_pdf_success(
+    mock_firestore_client_constructor: MagicMock,
+    test_client: TestClient,
+    db_session: Session,
+    parent_user: User,
+    student_user_one: User,
+    mock_firebase_auth_sdk_fixture
+):
+    # Link parent to student in PG DB
+    link = ParentChildLink(parent_id=parent_user.id, child_id=student_user_one.id)
+    db_session.add(link)
+    db_session.commit()
+
+    # Mock Firestore client instance and data (similar to test_get_child_dashboard_success)
+    mock_fs_client = MagicMock()
+    mock_firestore_client_constructor.return_value = mock_fs_client
+    now = datetime.now(timezone.utc)
+    mock_student_doc_data = {'overall_curriculum_progress': 65.0}
+    mock_topic_mastery_data = [
+        {'id': 'topic1', 'topic_name': 'Algebra Basics', 'progress_percentage': 95.0, 'skill_rating': 'Excellent', 'subject': 'Math', 'grade_level': '5'},
+    ]
+    mock_sessions_data = [
+        {'timestamp': (now - timedelta(days=1)).isoformat(), 'duration_minutes': 30, 'description': 'Session A'},
+    ]
+
+    mock_student_progress_doc_ref = MagicMock()
+    mock_fs_client.collection.return_value.document.return_value = mock_student_progress_doc_ref
+    mock_student_progress_doc_ref.get.return_value = create_mock_firestore_doc(mock_student_doc_data)
+
+    mock_topic_mastery_collection_ref = MagicMock()
+    mock_sessions_collection_actual_ref = MagicMock()
+    mock_sessions_query_obj = MagicMock()
+    mock_sessions_collection_actual_ref.where.return_value = mock_sessions_query_obj
+    mock_sessions_query_obj.order_by.return_value = mock_sessions_query_obj
+    mock_sessions_query_obj.stream.return_value = create_mock_firestore_stream(mock_sessions_data)
+
+    def collection_side_effect(collection_name):
+        if collection_name == 'topic_mastery':
+            mock_topic_mastery_collection_ref.stream.return_value = create_mock_firestore_stream(mock_topic_mastery_data)
+            return mock_topic_mastery_collection_ref
+        elif collection_name == 'sessions':
+            return mock_sessions_collection_actual_ref
+        return MagicMock()
+    mock_student_progress_doc_ref.collection.side_effect = collection_side_effect
+
+    set_mock_firebase_token(mock_firebase_auth_sdk_fixture, {
+        "uid": parent_user.firebase_uid, "email": parent_user.email, "name": parent_user.full_name, "role": "parent"
+    })
+
+    response = test_client.get(
+        f"/api/parent/children/{student_user_one.id}/progress_report_pdf",
+        headers={"Authorization": "Bearer validtoken"}
+    )
+    assert response.status_code == 200
+    assert response.headers['content-type'] == 'application/pdf'
+    expected_filename = f'attachment; filename="progress_report_{student_user_one.full_name.replace(" ", "_")}.pdf"'
+    assert response.headers['content-disposition'] == expected_filename
+    assert len(response.content) > 0 # Check that PDF content is not empty
+
+def test_get_child_progress_report_pdf_auth_errors(
+    test_client: TestClient,
+    db_session: Session,
+    parent_user: User,
+    student_user_one: User,
+    student_user_two: User, # Another student not linked to parent_user
+    mock_firebase_auth_sdk_fixture
+):
+    # Scenario 1: Requester not a parent
+    set_mock_firebase_token(mock_firebase_auth_sdk_fixture, {
+        "uid": student_user_one.firebase_uid, "email": student_user_one.email, "name": student_user_one.full_name, "role": "student"
+    })
+    response_not_parent = test_client.get(
+        f"/api/parent/children/{student_user_two.id}/progress_report_pdf", # student_user_one trying to access student_user_two's report
+        headers={"Authorization": "Bearer validtoken"}
+    )
+    assert response_not_parent.status_code == 403
+    assert response_not_parent.json()["detail"] == "Access denied: User is not a parent."
+
+    # Scenario 2: Parent not linked to child
+    # parent_user is authenticated, but student_user_two is not linked to parent_user
+    link = ParentChildLink(parent_id=parent_user.id, child_id=student_user_one.id) # parent linked to student_one
+    db_session.add(link)
+    db_session.commit()
+
+    set_mock_firebase_token(mock_firebase_auth_sdk_fixture, { # Authenticate as parent
+        "uid": parent_user.firebase_uid, "email": parent_user.email, "name": parent_user.full_name, "role": "parent"
+    })
+    response_not_linked = test_client.get(
+        f"/api/parent/children/{student_user_two.id}/progress_report_pdf", # parent tries to access student_two's report
+        headers={"Authorization": "Bearer validtoken"}
+    )
+    assert response_not_linked.status_code == 403
+    assert response_not_linked.json()["detail"] == "Access denied: You are not linked to this child."
+
+    # Scenario 3: Unauthenticated
+    error_instance_invalid = firebase_auth_errors.InvalidIdTokenError("auth/invalid-id-token", "Test token is invalid.")
+    set_mock_firebase_token(mock_firebase_auth_sdk_fixture, exception_to_raise=error_instance_invalid)
+    response_unauthenticated = test_client.get(
+         f"/api/parent/children/{student_user_one.id}/progress_report_pdf",
+        headers={"Authorization": "Bearer invalidtoken"}
+    )
+    assert response_unauthenticated.status_code == 401
+
 # Tests for GET /api/users/me/children
 
 def test_get_my_children_success_parent_with_children(
@@ -299,9 +406,11 @@ def test_get_child_dashboard_success(
 
     # Mock topic_mastery subcollection
     mock_topic_mastery_data = [
-        {'id': 'topic1', 'topic_name': 'Algebra Basics', 'progress_percentage': 95.0, 'skill_rating': 'Excellent'},
-        {'id': 'topic2', 'topic_name': 'Fractions', 'progress_percentage': 40.0, 'skill_rating': 'Needs Improvement'},
-        {'id': 'topic3', 'topic_name': 'Geometry', 'progress_percentage': 70.0, 'skill_rating': 'Satisfactory'},
+        {'id': 'topic1', 'topic_name': 'Algebra Basics', 'progress_percentage': 95.0, 'skill_rating': 'Excellent', 'subject': 'Math', 'grade_level': '5'},
+        {'id': 'topic2', 'topic_name': 'Fractions', 'progress_percentage': 40.0, 'skill_rating': 'Needs Improvement', 'subject': 'Math', 'grade_level': '5'},
+        {'id': 'topic3', 'topic_name': 'Geometry', 'progress_percentage': 70.0, 'skill_rating': 'Satisfactory', 'subject': 'Math', 'grade_level': '6'}, # Different grade
+        {'id': 'topic4', 'topic_name': 'Reading Comprehension', 'progress_percentage': 80.0, 'skill_rating': 'Excellent', 'subject': 'English', 'grade_level': '5'}, # Different subject
+        {'id': 'topic5', 'topic_name': 'Advanced Algebra', 'progress_percentage': 50.0, 'skill_rating': 'Satisfactory', 'subject': 'Math', 'grade_level': '5'}, # Grade 5 Math again
     ]
     # Configure the chain for topic_mastery
     mock_fs_client.collection.return_value.document.return_value.collection.return_value.stream.side_effect = [
@@ -370,10 +479,23 @@ def test_get_child_dashboard_success(
     assert dashboard_data["child_full_name"] == student_user_one.full_name
     assert dashboard_data["overall_curriculum_progress"] == 65.0
 
-    assert len(dashboard_data["progress_by_topic"]) == 3
-    assert dashboard_data["progress_by_topic"][0]["topic_name"] == "Algebra Basics"
-    assert dashboard_data["strengths"] == ["Algebra Basics"]
+    assert len(dashboard_data["progress_by_topic"]) == 5 # Corrected to 5
+    assert dashboard_data["progress_by_topic"][0]["topic_name"] == "Algebra Basics" # This will now be the first of 5 topics
+    assert "Algebra Basics" in dashboard_data["strengths"] # 95%
+    # Fractions (40.0) is a weakness. Advanced Algebra (50.0) is not (<50 rule).
     assert dashboard_data["weaknesses"] == ["Fractions"]
+
+
+    assert sorted(dashboard_data["subjects_practiced"]) == sorted([
+        "Algebra Basics", "Fractions", "Geometry", "Reading Comprehension", "Advanced Algebra"
+    ]) # Check subjects
+
+    # Specific Mastery Stats for "Grade 5 Math"
+    # Topics: Algebra Basics (95%), Fractions (40%), Advanced Algebra (50%)
+    # Average: (95 + 40 + 50) / 3 = 185 / 3 = 61.666... rounded to 61.7
+    assert len(dashboard_data["specific_mastery_stats"]) == 1
+    assert dashboard_data["specific_mastery_stats"][0]["label"] == "Grade 5 Math Progress"
+    assert dashboard_data["specific_mastery_stats"][0]["completed_percentage"] == 61.7
 
     assert len(dashboard_data["recent_activity_log"]) == 4 # All mocked sessions
     assert dashboard_data["recent_activity_log"][0]["description"] == "Session A"
@@ -414,10 +536,83 @@ def test_get_child_dashboard_success(
     assert dashboard_data["performance_trends"][2]["value"] == 1 # last week (Session C)
     assert dashboard_data["performance_trends"][3]["value"] == 2 # current week (Sessions A,B)
 
+    # LLM Summary should be None by default (no MOCK_LLM_RESPONSE set)
+    assert dashboard_data["llm_summary"] is None
+
     # Assert Alerts
-    # Mock data: Session A was 1 day ago (recent), Algebra Basics is 95% 'Excellent'
-    assert "Great job! Progress made in Algebra Basics (Excellent, 95.0%)." in dashboard_data["alerts"] # Added period
-    assert len(dashboard_data["alerts"]) == 1 # Only the mastery alert
+    # Mock data: Session A was 1 day ago (recent).
+    # "Algebra Basics" (95.0%, "Excellent") is a mastery.
+    # "Reading Comprehension" (80.0%, "Excellent") is also a mastery.
+    # Expecting 2 mastery alerts.
+    assert "Great job! Progress made in Algebra Basics (Excellent, 95.0%)." in dashboard_data["alerts"]
+    assert "Great job! Progress made in Reading Comprehension (Excellent, 80.0%)." in dashboard_data["alerts"]
+    assert len(dashboard_data["alerts"]) == 2
+
+
+@patch('backend.main.os.getenv') # Patch os.getenv for this test
+@patch('backend.main.firestore.client')
+def test_get_child_dashboard_with_llm_summary(
+    mock_firestore_client_constructor: MagicMock,
+    mock_os_getenv: MagicMock,
+    test_client: TestClient,
+    db_session: Session,
+    parent_user: User,
+    student_user_one: User,
+    mock_firebase_auth_sdk_fixture
+):
+    # Link parent to student in PG DB
+    link = ParentChildLink(parent_id=parent_user.id, child_id=student_user_one.id)
+    db_session.add(link)
+    db_session.commit()
+
+    # Configure os.getenv mock for MOCK_LLM_RESPONSE
+    # It needs to handle other os.getenv calls in main.py gracefully (e.g., for DATABASE_URL)
+    # Store original os.getenv
+    original_os_getenv = os.getenv
+    def getenv_side_effect(key, default=None):
+        if key == "MOCK_LLM_RESPONSE":
+            return f"Mock LLM Summary for {student_user_one.full_name}: Keep up the great work! Focus on continuing to explore new topics."
+        return original_os_getenv(key, default) # Call original for other keys
+    mock_os_getenv.side_effect = getenv_side_effect
+
+    # Mock Firestore client instance and data (can be minimal for this test if only summary is focus)
+    mock_fs_client = MagicMock()
+    mock_firestore_client_constructor.return_value = mock_fs_client
+    mock_student_doc_data = {'overall_curriculum_progress': 75.0} # Need some data for the prompt
+    mock_student_progress_doc_ref = MagicMock()
+    mock_fs_client.collection.return_value.document.return_value = mock_student_progress_doc_ref
+    mock_student_progress_doc_ref.get.return_value = create_mock_firestore_doc(mock_student_doc_data)
+
+    # Mock empty streams for topic_mastery and sessions as they are needed for prompt generation
+    mock_empty_stream = create_mock_firestore_stream([])
+    mock_topic_mastery_collection_ref = MagicMock()
+    mock_topic_mastery_collection_ref.stream.return_value = mock_empty_stream
+
+    mock_sessions_collection_actual_ref = MagicMock()
+    mock_sessions_query_obj = MagicMock()
+    mock_sessions_collection_actual_ref.where.return_value = mock_sessions_query_obj
+    mock_sessions_query_obj.order_by.return_value = mock_sessions_query_obj
+    mock_sessions_query_obj.stream.return_value = mock_empty_stream
+
+    def collection_side_effect(collection_name):
+        if collection_name == 'topic_mastery': return mock_topic_mastery_collection_ref
+        if collection_name == 'sessions': return mock_sessions_collection_actual_ref
+        return MagicMock()
+    mock_student_progress_doc_ref.collection.side_effect = collection_side_effect
+
+    set_mock_firebase_token(mock_firebase_auth_sdk_fixture, {
+        "uid": parent_user.firebase_uid, "email": parent_user.email, "name": parent_user.full_name, "role": "parent"
+    })
+
+    response = test_client.get(
+        f"/api/parent/children/{student_user_one.id}/dashboard",
+        headers={"Authorization": "Bearer validtoken"}
+    )
+    assert response.status_code == 200
+    dashboard_data = response.json()
+
+    expected_summary = f"Mock LLM Summary for {student_user_one.full_name}: Keep up the great work! Focus on continuing to explore new topics."
+    assert dashboard_data["llm_summary"] == expected_summary
 
 
 @patch('backend.main.firestore.client')
@@ -561,6 +756,8 @@ def test_get_child_dashboard_success_no_firestore_data(
     assert dashboard_data["progress_by_topic"] == []
     assert dashboard_data["strengths"] == []
     assert dashboard_data["weaknesses"] == []
+    assert dashboard_data["subjects_practiced"] == [] # Check empty subjects
+    assert dashboard_data["specific_mastery_stats"] == [] # Check empty specific stats
     assert dashboard_data["recent_activity_log"] == []
     assert dashboard_data["total_tutoring_time_week_minutes"] == 0
     assert dashboard_data["sessions_completed_week"] == 0

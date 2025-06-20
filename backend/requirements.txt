@@ -2,6 +2,7 @@ fastapi
 uvicorn[standard]
 # python-jose[cryptography] # REMOVED
 google-auth # firebase-admin might need this, or bring its own. Keep for now.
+google-generativeai
 # google-api-python-client # REMOVED (if only for OAuth user info)
 # google-auth-oauthlib # REMOVED
 # itsdangerous # REMOVED
@@ -10,6 +11,7 @@ psycopg2-binary
 SQLAlchemy
 python-dotenv
 firebase-admin
+reportlab
 # Testing dependencies
 pytest
 httpx
