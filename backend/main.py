@@ -15,7 +15,7 @@ from fastapi import Request as FastAPIRequest # Renamed to avoid conflict with '
 from starlette.responses import Response as StarletteResponse # For setting cookies
 from dotenv import load_dotenv
 from pydantic import BaseModel
-from typing import List, Optional, Dict # Added
+from typing import List, Optional, Dict, Any # Ensure Any is imported
 import google.generativeai as genai # Added
 from google.generativeai.types import HarmCategory, HarmBlockThreshold # For safety settings
 import os # Already present, but good to ensure
@@ -103,12 +103,29 @@ class ChatMessage(BaseModel):
 class TutorQueryRequest(BaseModel):
     query: str
     history: Optional[List[ChatMessage]] = None
-    grade_level: Optional[str] = "middle school"
+    grade_level: Optional[str] = "middle school" # This is a fallback or general setting
+    selected_standard_id: Optional[str] = None # New field
 
 class TutorQueryResponse(BaseModel):
     reply: str
 
+# Simplified Pydantic model for curriculum structure for now (as per subtask description)
+# Not used by the endpoint directly in this simplified version, but good for planning.
+class CurriculumSubject(BaseModel):
+    name: str
+    grades: Dict[str, Any] # Keeping it flexible
+
 app = FastAPI()
+
+@app.get("/api/curriculum", response_model=Dict[str, Any])
+async def get_curriculum_structure(
+    # current_user: User = Depends(get_current_user) # Optional: Protect if needed
+):
+    raw_data = curriculum_utils.load_curriculum_data()
+    if not raw_data:
+        # Consider returning a 404 or specific error if data is expected but not found
+        return {}
+    return raw_data
 
 def get_db():
     db = SessionLocal()
@@ -292,12 +309,42 @@ async def ask_tutor(
         # 1. Determine effective grade_level and framework
         effective_grade_level = current_user.selected_grade_level if current_user.selected_grade_level else request.grade_level
         effective_framework = current_user.curriculum_framework if current_user.curriculum_framework else None
+        # For now, assume subject might be implicitly part of framework or general knowledge.
+        # A user profile could be extended to have a 'current_subject'.
+        user_subject = None # Placeholder: This could be derived from user profile or request in future
 
-        # 2. Initial Topic/Standard Identification (Placeholder)
         identified_standard_id = None
         identified_standard_description = None
 
-        # 3. Construct Persona Prompt with Curriculum Context
+        if request.selected_standard_id:
+            # Priority given to explicitly selected standard
+            standard_details = curriculum_utils.get_standard_details(request.selected_standard_id)
+            if standard_details:
+                identified_standard_id = request.selected_standard_id
+                identified_standard_description = standard_details.get("description")
+                # Optionally, you might want to ensure this standard's grade/framework aligns with user's profile
+                # or use the standard's own grade/framework for this specific query's context.
+                # For now, we'll use the standard's description directly.
+                print(f"Using explicitly selected standard: {identified_standard_id}")
+            else:
+                print(f"Warning: selected_standard_id '{request.selected_standard_id}' not found in curriculum data.")
+
+        if not identified_standard_id and request.query: # Fallback to keyword search if no explicit selection or selection failed
+            relevant_standards = curriculum_utils.find_relevant_standards(
+                query=request.query,
+                user_grade=effective_grade_level,
+                user_framework=effective_framework,
+                user_subject=user_subject
+            )
+            if relevant_standards:
+                top_standard = relevant_standards[0] # Select the one with the highest score
+                identified_standard_id = top_standard.get("standard_id")
+                identified_standard_description = top_standard.get("description")
+                # Log for debugging:
+                print(f"Identified standard for query '{request.query}': {identified_standard_id} (Score: {top_standard.get('score')})")
+
+
+        # Construct Persona Prompt
         persona_parts = [
             "You are a helpful and friendly AI tutor for K-12 students."
         ]
@@ -307,11 +354,14 @@ async def ask_tutor(
             persona_parts.append(f"They are following the {effective_framework} curriculum.")
 
         if identified_standard_description:
-            persona_parts.append(f"The current learning focus is on: '{identified_standard_description}'. Please ensure your explanation aligns with this topic.")
+            persona_parts.append(f"The current learning focus, based on their question, seems to be related to: '{identified_standard_description}'. Please ensure your explanation aligns with this topic and standard.")
+        elif user_subject: # If no specific standard, but subject is known
+             persona_parts.append(f"Try to keep the context within the {user_subject} subject area if appropriate.")
+
 
         persona_parts.append(
             "Your primary goal is to explain concepts clearly, provide age-appropriate examples, "
-            "and stay aligned with their specified curriculum (grade and framework). "
+            "and stay aligned with their specified curriculum (grade, framework, and identified standard if any). "
             "If a question seems to deviate significantly from their academic scope or curriculum, "
             "politely acknowledge it, and then gently guide them back to topics relevant to their studies, "
             "or clearly state that it's outside the current educational focus. Avoid answering off-topic questions directly."
@@ -341,7 +391,9 @@ async def ask_tutor(
 
         # Start chat session and send message
         chat_session = instructed_model.start_chat(history=generation_history if generation_history else [])
-        response = chat_session.send_message(request.query)
+        # If a standard is selected and query is empty, use a default query to explain the standard.
+        query_for_model = request.query if request.query or not identified_standard_id else f"Please explain the topic: {identified_standard_description or identified_standard_id}"
+        response = chat_session.send_message(query_for_model)
 
         # Handle response
         if not response.parts:
@@ -355,34 +407,34 @@ async def ask_tutor(
         ai_reply = response.text # Accessing .text directly concatenates parts
 
         # Basic Curriculum Progress Tagging (Placeholder - active when identified_standard_id is available)
-        # identified_standard_id would come from a more advanced topic/standard identification logic
-        # For example:
-        # identified_standard_id = "CCSS.MATH.CONTENT.5.NF.A.1" # This would be dynamically determined
-
-        if identified_standard_id: # This will be False for now, as identified_standard_id is None
+        # Update Curriculum Progress if a standard was identified
+        if identified_standard_id:
             progress_entry = db.execute(
-                select(UserCurriculumProgress).where(
+                select(UserCurriculumProgress).where( # Ensure UserCurriculumProgress is defined and select is imported
                     UserCurriculumProgress.user_id == current_user.id,
                     UserCurriculumProgress.standard_id == identified_standard_id
                 )
             ).scalar_one_or_none()
 
             if progress_entry:
-                progress_entry.status = "practiced" # Or update based on more complex logic
-                progress_entry.last_practiced_on = datetime.utcnow()
+                progress_entry.status = "practiced"
+                progress_entry.last_practiced_on = datetime.utcnow() # Make sure datetime is imported
             else:
                 progress_entry = UserCurriculumProgress(
                     user_id=current_user.id,
                     standard_id=identified_standard_id,
                     status="practiced"
+                    # last_practiced_on will use default=datetime.utcnow
                 )
                 db.add(progress_entry)
 
             try:
                 db.commit()
-            except Exception as e_progress: # Use a different variable name for the exception
+                db.refresh(progress_entry) # Refresh to get DB defaults like ID, last_practiced_on
+            except Exception as e: # Renamed exception variable to avoid conflict
                 db.rollback()
-                print(f"Error saving curriculum progress: {e_progress}") # Log error, but don't fail the tutor response
+                print(f"Error saving curriculum progress for standard {identified_standard_id}: {e}")
+
 
         return TutorQueryResponse(reply=ai_reply)
 
@@ -390,7 +442,6 @@ async def ask_tutor(
         print(f"Error in ask_tutor endpoint: {e}")
         if isinstance(e, HTTPException):
             raise
-        # For other types of errors, ensure a generic but informative message is sent.
         raise HTTPException(status_code=500, detail=f"An error occurred while processing your request with the AI tutor.")
 
 @app.post("/api/auth/logout")

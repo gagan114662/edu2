@@ -1,16 +1,55 @@
 import React, { useState, useRef, useEffect } from 'react';
 import { useAuth } from '../context/AuthContext';
+import { useLocation, useNavigate } from 'react-router-dom'; // Add useNavigate
 
 const ChatInterface = () => {
     const [messages, setMessages] = useState([
-        { id: Date.now(), sender: 'tutor', text: "Hello! I'm your AI Tutor. How can I help you today?" }
+        // Initial message can be dynamic based on focus later
     ]);
     const [inputText, setInputText] = useState('');
     const [isLoading, setIsLoading] = useState(false);
     const [error, setError] = useState(null);
-    const { token, user } = useAuth(); // Destructure user as well
+    const { token, user } = useAuth();
+    const location = useLocation();
+    const navigate = useNavigate(); // For clearing state
+
+    const [currentFocusStandardId, setCurrentFocusStandardId] = useState(null);
+    const [currentFocusDescription, setCurrentFocusDescription] = useState(null);
 
     const messagesEndRef = useRef(null);
+
+    // Effect to handle initial message based on focus or welcome
+    useEffect(() => {
+        if (!currentFocusStandardId && messages.length === 0) {
+             setMessages([{ id: Date.now() + Math.random(), sender: 'tutor', text: "Hello! I'm your AI Tutor. How can I help you today?" }]);
+        }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [currentFocusStandardId]); // Run when focus changes, or on initial load if messages are empty
+
+    useEffect(() => {
+        if (location.state?.selectedStandardId || location.state?.selectedTopicName) {
+            const { selectedStandardId, selectedStandardDescription, selectedTopicName, selectedTopicDescription } = location.state;
+
+            let focusId = selectedStandardId || selectedTopicName;
+            let focusDescription = selectedStandardDescription || selectedTopicDescription || focusId;
+
+            setCurrentFocusStandardId(focusId); // Standard ID or Topic Name
+            setCurrentFocusDescription(focusDescription);
+
+            setMessages(prev => [
+                // ...prev, // Optionally keep previous messages or clear them for new focus
+                {
+                    id: Date.now() + Math.random(),
+                    sender: 'system',
+                    text: `Now focusing on: ${focusDescription}. Ask a question or type 'explain'.`
+                }
+            ]);
+            // Clear the location state
+            const { state, ...rest } = location;
+            navigate(location.pathname, { ...rest, replace: true, state: {} });
+        }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [location.state]); // Removed navigate from deps, it's stable
 
     const scrollToBottom = () => {
         messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -18,24 +57,36 @@ const ChatInterface = () => {
 
     useEffect(scrollToBottom, [messages]);
 
-    const handleSendMessage = async () => {
-        if (!inputText.trim() || isLoading) return;
+    const handleSendMessage = async (queryOverride) => {
+        const queryToSend = typeof queryOverride === 'string' ? queryOverride : inputText.trim();
 
-        const currentQuery = inputText.trim();
-        // Capture messages before adding the new one for history
-        const historySnapshot = [...messages];
+        // Allow sending if a focus is set, even with empty queryToSend (backend handles default prompt)
+        if (!queryToSend && !currentFocusStandardId) {
+            console.log("No query and no focus standard ID.");
+            return;
+        }
+        if (isLoading) return;
 
-        const userMessage = { id: Date.now(), sender: 'user', text: currentQuery };
-        setMessages(prevMessages => [...prevMessages, userMessage]);
+        const userMessageText = queryToSend;
+        // Add user message to UI only if it's a user-typed message (not programmatic)
+        if (typeof queryOverride !== 'string' && userMessageText) {
+            const userMessage = { id: Date.now(), sender: 'user', text: userMessageText };
+            setMessages(prevMessages => [...prevMessages, userMessage]);
+        }
+        if (typeof queryOverride !== 'string') setInputText(''); // Clear input only for user-typed messages
 
-        setInputText('');
         setIsLoading(true);
         setError(null);
 
-        const historyForAPI = historySnapshot.map(msg => ({
-            role: msg.sender === 'user' ? 'user' : 'model',
-            parts: [msg.text]
-        }));
+        // Prepare history from messages state, excluding any system messages
+        const historyForAPI = messages
+            .filter(msg => msg.sender === 'user' || msg.sender === 'tutor') // Only user/tutor messages for history
+            .map(msg => ({
+                role: msg.sender === 'user' ? 'user' : 'model',
+                parts: [msg.text]
+            }));
+
+        const gradeLevelForAPI = (user?.selected_grade_level) || 'middle school';
 
         try {
             const response = await fetch('/api/askTutor', {
@@ -45,9 +96,10 @@ const ChatInterface = () => {
                     'Authorization': `Bearer ${token}`,
                 },
                 body: JSON.stringify({
-                    query: currentQuery,
+                    query: queryToSend,
                     history: historyForAPI,
-                    grade_level: (user && user.selected_grade_level) ? user.selected_grade_level : 'middle school' // Use dynamic grade_level
+                    grade_level: gradeLevelForAPI,
+                    selected_standard_id: currentFocusStandardId
                 }),
             });
 
@@ -78,15 +130,38 @@ const ChatInterface = () => {
     };
 
     return (
-        <div className="p-4 bg-white shadow-md rounded-lg w-full max-w-2xl mx-auto my-4">
-            <div className="h-96 overflow-y-auto mb-4 border p-3 rounded-md space-y-2 bg-gray-50">
+        <div className="p-4 bg-white shadow-lg rounded-lg w-full max-w-2xl mx-auto my-4">
+            {currentFocusDescription && (
+                <div className="p-3 mb-4 bg-indigo-100 text-indigo-800 rounded-lg shadow-sm border border-indigo-200">
+                    <div className="flex justify-between items-center">
+                        <div>
+                            <strong className="font-semibold">Current Focus:</strong>
+                            <span className="ml-2 text-sm">{currentFocusDescription}</span>
+                        </div>
+                        <button
+                            onClick={() => {
+                                setCurrentFocusStandardId(null);
+                                setCurrentFocusDescription(null);
+                                setMessages(prev => [...prev, {id: Date.now() + Math.random(), sender: 'system', text: "Curriculum focus cleared."}]);
+                            }}
+                            className="text-xs bg-indigo-500 hover:bg-indigo-600 text-white py-1 px-3 rounded-full shadow-md transition-colors"
+                            title="Clear current curriculum focus"
+                        >
+                            Clear Focus
+                        </button>
+                    </div>
+                </div>
+            )}
+            <div className="h-96 overflow-y-auto mb-4 border p-3 rounded-md space-y-2 bg-gray-50 shadow-inner">
                 {messages.map((msg) => (
-                    <div key={msg.id} className={`flex ${msg.sender === 'user' ? 'justify-end' : 'justify-start'}`}>
+                    <div key={msg.id} className={`flex ${msg.sender === 'user' ? 'justify-end' : msg.sender === 'system' ? 'justify-center' : 'justify-start'}`}>
                         <div className={`max-w-xs lg:max-w-md xl:max-w-lg px-4 py-2 rounded-xl shadow-md ${
                             msg.sender === 'user'
                                 ? 'bg-blue-500 text-white'
-                                : 'bg-gray-200 text-gray-800' // Tutor bubble with better contrast
-                        } whitespace-pre-wrap`}> {/* Added whitespace-pre-wrap */}
+                                : msg.sender === 'tutor'
+                                    ? 'bg-gray-200 text-gray-800'
+                                    : 'bg-yellow-100 text-yellow-800 text-xs italic' // System message style
+                        } whitespace-pre-wrap`}>
                             {msg.text}
                         </div>
                     </div>

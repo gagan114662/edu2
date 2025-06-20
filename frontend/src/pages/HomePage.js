@@ -1,8 +1,8 @@
 import React from 'react';
 import { useAuth } from '../context/AuthContext';
-import { useNavigate } from 'react-router-dom';
+import { useNavigate, Link } from 'react-router-dom'; // Import Link
 import ChatInterface from '../components/ChatInterface';
-import ProfileSettings from '../components/ProfileSettings'; // Import ProfileSettings
+import ProfileSettings from '../components/ProfileSettings';
 
 const HomePage = () => {
     const { isAuthenticated, user, logout, loading: authLoading } = useAuth(); // get loading state
@@ -51,16 +51,20 @@ const HomePage = () => {
                 )}
                 <button
                     onClick={handleLogout}
-                    className="bg-red-500 hover:bg-red-700 text-white font-bold py-2 px-4 rounded focus:outline-none focus:shadow-outline"
+                    className="bg-red-500 hover:bg-red-700 text-white font-bold py-2 px-4 rounded focus:outline-none focus:shadow-outline mr-2" // Added mr-2 for spacing
                 >
                     Logout
                 </button>
-                </div>
-
-                <ProfileSettings /> {/* Add ProfileSettings component */}
+                {/* Link to Curriculum Browser */}
+                <Link to="/curriculum" className="ml-2 bg-green-500 hover:bg-green-700 text-white font-bold py-2 px-4 rounded focus:outline-none focus:shadow-outline">
+                    Browse Curriculum
+                </Link>
+                </div> {/* End of the user info box's content, button container */}
+                {/* ProfileSettings and ChatInterface are outside the user info box, but within the max-w-4xl container */}
+                <ProfileSettings />
                 <ChatInterface />
-            </div>
-        </div>
+            </div> {/* End of w-full max-w-4xl */}
+        </div> {/* End of main flex container */}
     );
 };
 

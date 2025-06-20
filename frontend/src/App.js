@@ -4,6 +4,7 @@ import LoginPage from './pages/LoginPage';
 import HomePage from './pages/HomePage';
 import AuthCallbackPage from './pages/AuthCallbackPage';
 import ProtectedRoute from './components/ProtectedRoute'; // Import ProtectedRoute
+import CurriculumPage from './pages/CurriculumPage'; // Import the new page
 import './App.css'; // Assuming you have some global styles, or use index.css
 
 function App() {
@@ -15,7 +16,8 @@ function App() {
         {/* Protected Routes: */}
         <Route element={<ProtectedRoute />}>
           <Route path="/" element={<HomePage />} />
-          {/* Add other protected routes here as children of ProtectedRoute */}
+          <Route path="/curriculum" element={<CurriculumPage />} /> {/* Add new route */}
+          {/* Add other protected routes here */}
         </Route>
         {/* You can add a 404 Not Found page here */}
         {/* <Route path="*" element={<NotFoundPage />} /> */}

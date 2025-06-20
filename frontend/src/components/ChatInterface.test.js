@@ -5,44 +5,63 @@ import '@testing-library/jest-dom'; // For extended matchers like .toBeInTheDocu
 import ChatInterface from './ChatInterface';
 import { AuthContext } from '../context/AuthContext'; // To provide mock context
 
+import { useLocation, useNavigate } from 'react-router-dom';
+
 // Mock fetch globally
 global.fetch = jest.fn();
 
-// Mock scrollToView as it's called by jsdom and can cause errors/warnings if not mocked
+// Mock scrollToView
 window.HTMLElement.prototype.scrollIntoView = jest.fn();
 
-const mockAuthContextValue = {
+// Default mock AuthContext value
+const defaultMockAuthContextValue = {
   token: 'test-token',
   isAuthenticated: true,
-  user: { name: 'Test User', email: 'test@example.com' },
+  user: { name: 'Test User', email: 'test@example.com', selected_grade_level: 'Grade 5' }, // Add potential user profile fields
   login: jest.fn(),
   logout: jest.fn(),
+  updateUserProfile: jest.fn(),
+  fetchUserProfile: jest.fn(),
   loading: false,
 };
 
-// Wrapper component to provide the AuthContext
-const WrappedChatInterface = () => (
-  <AuthContext.Provider value={mockAuthContextValue}>
+// Mock react-router-dom hooks
+const mockNavigateFn = jest.fn();
+let mockLocationState = {}; // Allow this to be changed per test
+
+jest.mock('react-router-dom', () => ({
+  ...jest.requireActual('react-router-dom'),
+  useLocation: () => ({ state: mockLocationState, pathname: '/' }),
+  useNavigate: () => mockNavigateFn,
+}));
+
+
+// Wrapper component to provide the AuthContext, allowing override for specific tests
+const WrappedChatInterface = (authProviderProps = {}) => (
+  <AuthContext.Provider value={{ ...defaultMockAuthContextValue, ...authProviderProps }}>
     <ChatInterface />
   </AuthContext.Provider>
 );
 
+
 describe('ChatInterface Component', () => {
   beforeEach(() => {
-    // Clear mock call counts and implementations before each test
     fetch.mockClear();
-    fetch.mockImplementation(() => // Default mock for successful responses
+    fetch.mockImplementation(() =>
       Promise.resolve({
         ok: true,
         json: () => Promise.resolve({ reply: 'Mocked AI response' }),
       })
     );
     window.HTMLElement.prototype.scrollIntoView.mockClear();
+    mockNavigateFn.mockClear();
+    mockLocationState = {}; // Reset location state for each test
   });
 
-  test('renders initial welcome message, input field, and send button', () => {
+  test('renders initial welcome message if no focus, input field, and send button', () => {
     render(<WrappedChatInterface />);
-
+    // Welcome message is now conditional on no focus and messages being empty initially
+    // This test assumes no location state is set for focus.
     expect(screen.getByText(/Hello! I'm your AI Tutor. How can I help you today?/i)).toBeInTheDocument();
     expect(screen.getByPlaceholderText(/Ask your question.../i)).toBeInTheDocument();
     expect(screen.getByRole('button', { name: /Send/i })).toBeInTheDocument();
@@ -75,11 +94,18 @@ describe('ChatInterface Component', () => {
           'Content-Type': 'application/json',
           'Authorization': 'Bearer test-token',
         },
-        body: JSON.stringify({
+        body: JSON.stringify(expect.objectContaining({ // Use objectContaining for body
           query: 'Test query',
-          history: [{ role: 'model', parts: ["Hello! I'm your AI Tutor. How can I help you today?"] }],
-          grade_level: 'middle school',
-        }),
+          // History will be empty if welcome message is not shown due to focus, or includes welcome
+          // For this test, assume welcome message was the only one, then user typed.
+          // If initial message is dynamic, this assertion needs to be more flexible or specific to setup.
+          // The ChatInterface adds welcome message if messages array is empty and no focus is set.
+          history: expect.arrayContaining([
+            expect.objectContaining({ role: 'model', parts: ["Hello! I'm your AI Tutor. How can I help you today?"] })
+          ]),
+          grade_level: 'Grade 5', // From defaultMockAuthContextValue.user
+          selected_standard_id: null, // No focus set in this test
+        })),
       })
     );
 
@@ -99,7 +125,10 @@ describe('ChatInterface Component', () => {
     expect(fetch).toHaveBeenCalledWith(
       '/api/askTutor',
       expect.objectContaining({
-        body: JSON.stringify(expect.objectContaining({ query: 'Enter key test' })),
+        body: JSON.stringify(expect.objectContaining({
+            query: 'Enter key test',
+            selected_standard_id: null
+        })),
       })
     );
     expect(await screen.findByText('Mocked AI response')).toBeInTheDocument();
@@ -108,7 +137,7 @@ describe('ChatInterface Component', () => {
 
 
   test('handles API error and displays error message in chat and error area', async () => {
-    fetch.mockImplementationOnce(() => // Override fetch for this specific test
+    fetch.mockImplementationOnce(() =>
       Promise.resolve({
         ok: false,
         status: 500,
