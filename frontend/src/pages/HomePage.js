@@ -56,10 +56,15 @@ const HomePage = () => {
                     Logout
                 </button>
                 {/* Link to Curriculum Browser */}
-                <Link to="/curriculum" className="ml-2 bg-green-500 hover:bg-green-700 text-white font-bold py-2 px-4 rounded focus:outline-none focus:shadow-outline">
+                <Link to="/curriculum" className="bg-green-500 hover:bg-green-700 text-white font-bold py-2 px-4 rounded focus:outline-none focus:shadow-outline">
                     Browse Curriculum
                 </Link>
-                </div> {/* End of the user info box's content, button container */}
+                <Link to="/classroom" className="ml-2 bg-yellow-500 hover:bg-yellow-600 text-white font-bold py-2 px-4 rounded focus:outline-none focus:shadow-outline">
+                    Google Classroom
+                </Link>
+                </div> {/* End of the button container div */}
+                </div> {/* End of the user info box's content div p-8 */}
+
                 {/* ProfileSettings and ChatInterface are outside the user info box, but within the max-w-4xl container */}
                 <ProfileSettings />
                 <ChatInterface />

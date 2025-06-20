@@ -1,11 +1,11 @@
 # AI Tutor Project
 
-This project implements an AI-powered tutoring system with a web-based chat interface. Students can ask questions and receive answers from an AI tutor.
+This project implements an AI-powered tutoring system with a web-based chat interface. Students can ask questions and receive answers from an AI tutor, with features enhanced by Google Classroom integration.
 
 ## Project Structure
 
 *   `/frontend`: Contains the React-based user interface.
-*   `/backend`: Contains the Python FastAPI backend that handles business logic and communication with the AI model.
+*   `/backend`: Contains the Python FastAPI backend that handles business logic, AI model communication, and Google Classroom API interactions.
 
 ## Setup Instructions
 
@@ -13,7 +13,7 @@ This project implements an AI-powered tutoring system with a web-based chat inte
 
 *   Node.js and npm (for frontend)
 *   Python 3.9+ and pip (for backend)
-*   Access to Google Cloud and a Gemini API key.
+*   Access to Google Cloud, a configured OAuth 2.0 client ID and secret, and a Gemini API key.
 *   A configured PostgreSQL database.
 
 ### Backend Setup
@@ -33,87 +33,90 @@ This project implements an AI-powered tutoring system with a web-based chat inte
     ```bash
     pip install -r requirements.txt
     ```
+    (Ensure `google-api-python-client` is included for Google Classroom integration, in addition to other dependencies like `fastapi`, `sqlalchemy`, `google-auth-oauthlib`, `google-generativeai`).
 
 4.  **Configure environment variables:**
-    *   Copy the example environment file:
-        ```bash
-        cp .env.example .env
-        ```
-    *   Edit the `.env` file with your specific configurations (see `.env.example` for all options). Key variables include `DATABASE_URL`, Google OAuth credentials, `JWT_SECRET_KEY`, `FRONTEND_URL`, and `GEMINI_API_KEY`.
-    *   Note: The User profile in the database now also stores `selected_grade_level` and `curriculum_framework` for curriculum alignment features.
+    *   Copy the example environment file: `cp .env.example .env`
+    *   Edit the `.env` file with your specific configurations. Key variables include:
+        *   `DATABASE_URL`: Your PostgreSQL connection string.
+        *   `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`: Your Google OAuth Client ID and Secret.
+        *   `GOOGLE_REDIRECT_URI`: Your Google OAuth redirect URI (e.g., `http://localhost:8000/auth/google/callback`).
+        *   `JWT_SECRET_KEY`: A strong secret key for internal JWTs.
+        *   `FRONTEND_URL`: The URL where your frontend is running (e.g., `http://localhost:3000`).
+        *   `GEMINI_API_KEY`: Your API key for the Gemini AI model.
+    *   **User Data:** The `User` model in the database now includes fields to store curriculum preferences (`selected_grade_level`, `curriculum_framework`) and Google API OAuth tokens (`google_access_token`, `google_refresh_token`, `google_token_expiry`, `google_granted_scopes`).
 
 5.  **Curriculum Data:**
-    *   The backend uses a `backend/curriculum_data.json` file to store curriculum structures (subjects, grades, frameworks, topics, standards). This file is loaded by `curriculum_utils.py` at runtime to provide context to the AI tutor, primarily via the `find_relevant_standards` function which performs keyword-based matching. The basic structure is: `Subject -> Grade -> Framework -> Topic -> StandardID: {description, keywords}`.
+    *   The backend uses `backend/curriculum_data.json` to store curriculum structures. This is loaded by `curriculum_utils.py` for features like keyword-based standard identification (`find_relevant_standards`).
 
-6.  **Run database migrations (if applicable):**
-    *   The application uses SQLAlchemy and creates tables based on model definitions in `main.py` if they don't exist (`Base.metadata.create_all(bind=engine)`). This includes the `users` table (with curriculum profile fields) and the `user_curriculum_progress` table. Ensure your database is running and accessible.
+6.  **Database Initialization:**
+    *   The application creates database tables based on SQLAlchemy models in `main.py` if they don't exist (via `Base.metadata.create_all(bind=engine)`). This includes the `users` table (with new Google token fields) and `user_curriculum_progress`.
 
 7.  **Start the backend server:**
     ```bash
     uvicorn main:app --reload --port 8000
     ```
-    The backend should now be running on `http://localhost:8000`.
 
 ### Frontend Setup
+(Instructions remain largely the same: `cd frontend`, `npm install`, `npm start`)
 
-1.  **Navigate to the frontend directory:**
-    ```bash
-    cd frontend
-    ```
+## Authentication and Permissions
 
-2.  **Install dependencies:**
-    ```bash
-    npm install
-    ```
+### Google OAuth2 Flow
+The application uses Google OAuth2 for user authentication. Upon login, it requests permissions (scopes) to access user profile information and, optionally, Google Workspace for Education data.
 
-3.  **Start the frontend development server:**
-    ```bash
-    npm start
-    ```
-    The frontend should now be running on `http://localhost:3000` and will connect to the backend API.
+### Google Permissions (OAuth Scopes)
+To enable integration with Google Workspace for Education, the application requests the following permissions:
+*   **Basic Login:** `openid`, `userinfo.email`, `userinfo.profile`.
+*   **Google Classroom (Read-only):**
+    *   `https://www.googleapis.com/auth/classroom.courses.readonly`: To view your courses.
+    *   `https://www.googleapis.com/auth/classroom.coursework.me.readonly`: To view your assignments in those courses.
+*   *(Future integrations like Calendar, Drive, Meet will add their specific scopes here.)*
+These permissions allow the AI Tutor to access educational data to provide a more personalized and context-aware experience. You can manage these permissions via your Google Account settings.
 
 ## API Overview
 
 ### User and Profile API
 *   `GET /api/users/me`: Returns current authenticated user's details, including `selected_grade_level` and `curriculum_framework`.
-*   `PUT /api/users/me/profile`: Updates the current user's profile. Request body can include:
-    *   `selected_grade_level` (string, optional)
-    *   `curriculum_framework` (string, optional)
+*   `PUT /api/users/me/profile`: Updates curriculum preferences.
 
 ### Curriculum API
-*   `GET /api/curriculum`: Fetches the entire curriculum structure from `backend/curriculum_data.json`. This is used by the frontend to power the Curriculum Browser. The response is currently the raw JSON data.
+*   `GET /api/curriculum`: Fetches the curriculum structure from `backend/curriculum_data.json`, used by the frontend's Curriculum Browser.
+
+### Google Classroom API Endpoints
+*   `GET /api/classroom/courses`: Retrieves a list of the authenticated user's active Google Classroom courses. Requires `classroom.courses.readonly` scope.
+*   `GET /api/classroom/courses/{course_id}/assignments`: Retrieves published assignments for the specified `course_id`. Requires `classroom.coursework.me.readonly` scope.
 
 ### AI Tutor API
-*   `POST /api/askTutor`: This endpoint is the core of the AI tutor.
-    *   It attempts to identify a specific curriculum standard relevant to the user's query. If a `selected_standard_id` is provided in the request (e.g., from the Curriculum Browser), that standard is prioritized. Otherwise, it performs a keyword-based search using `curriculum_utils.find_relevant_standards()` based on the query text.
-    *   The user's profile settings for `selected_grade_level` and `curriculum_framework` are used to scope the standard search and tailor the AI's persona.
-    *   Progress on identified or selected standards is tagged in the `user_curriculum_progress` table.
+*   `POST /api/askTutor`: Core AI interaction endpoint.
+    *   Prioritizes `selected_standard_id` from the request (e.g., if user selected a standard in the UI).
+    *   If no explicit standard is selected, uses `curriculum_utils.find_relevant_standards()` for keyword-based identification from the query.
+    *   Uses user's profile (`selected_grade_level`, `curriculum_framework`) to tailor AI persona and scope search.
+    *   Logs progress against identified/selected standards in `user_curriculum_progress` table.
 
 ## Key Features
 
 ### User Interface
-*   **Authentication:** Google OAuth for user login.
-*   **Chat Interface:** Main interface for interacting with the AI tutor. It can now:
-    *   Receive a curriculum focus (a specific standard or topic) selected from the Curriculum Browser.
-    *   Display the active curriculum focus to the user (e.g., "Current Focus: Adding Fractions").
-    *   Provide a "Clear Focus" button to return to general Q&A.
-    *   Transmit the `selected_standard_id` to the backend when a focus is active.
-*   **Profile Settings:** Users can set their preferred `selected_grade_level` and `curriculum_framework`.
-*   **Curriculum Browser:** Accessible via the `/curriculum` route, this feature allows users to:
-    *   Navigate the available curriculum structure (subjects, grades, topics, down to specific standards).
-    *   Select a standard or topic they wish to focus on.
-    *   Initiate a tutoring session focused on the selected item by clicking "Practice This" (or similar), which directs them to the main chat interface with the chosen item as the active context.
+*   **Authentication:** Google OAuth for login, including requesting Classroom permissions.
+*   **Chat Interface:** Main interaction point with the AI.
+    *   Can receive a curriculum focus (standard/topic) from the Curriculum Browser.
+    *   Displays the active focus and allows clearing it.
+    *   Sends `selected_standard_id` to the backend if a focus is active.
+*   **Profile Settings:** Allows users to set `selected_grade_level` and `curriculum_framework`.
+*   **Curriculum Browser (`/curriculum` route):**
+    *   Enables navigation of curriculum data (subjects, grades, topics, standards).
+    *   Allows selection of a standard/topic to focus on, then navigates to the chat interface with this context.
+*   **Google Classroom Integration (`/classroom` route):**
+    *   Displays a list of the user's Google Classroom courses.
+    *   Allows viewing assignments for a selected course.
 
 ### AI Tutor Functionality
-The AI tutor uses the Google Gemini API to generate responses. Ensure your `GEMINI_API_KEY` is correctly set in the backend's `.env` file.
-*   **Curriculum Alignment:** The tutor now aligns its responses with K-12 curriculum standards.
-    *   **Contextual Prompts:** The system uses `selected_grade_level`, `curriculum_framework` (from user profile), and any identified/selected specific standard to tailor the AI's persona and instructions.
-    *   **Content Relevance:** The AI is instructed to stay within the scope of the specified curriculum, gently redirecting off-topic queries.
-    *   **Standard Identification:** Uses `curriculum_data.json` and the `find_relevant_standards` utility for keyword-based matching of queries to standards, or prioritizes user's explicit selection from the browser.
-*   **Progress Tagging (Basic):** The system logs curriculum standards that have been "practiced" during tutoring sessions in the `user_curriculum_progress` database table.
-*   **General Capabilities:**
-    *   Understands student queries.
-    *   Provides age-appropriate explanations.
-    *   Maintains conversation context.
-    *   Adheres to content safety guidelines via Gemini API's built-in filters.
+Powered by Google Gemini API, with enhanced curriculum and Classroom awareness.
+*   **Curriculum Alignment:**
+    *   **Contextual Prompts:** Uses user profile settings and identified/selected standards for tailored AI interaction.
+    *   **Content Relevance:** AI is guided to stay on-topic.
+    *   **Standard Identification:** Combines explicit user selection with keyword-based matching (`find_relevant_standards`).
+*   **Progress Tagging:** Logs "practiced" standards.
+*   **Google Classroom Context (Initial):** Can list user's courses and assignments, laying groundwork for deeper integration (e.g., tutor using assignment details in prompts).
+*   **General Capabilities:** Query understanding, age-appropriate explanations, conversation context, safety filters.
 ```

@@ -1,10 +1,9 @@
 import os
-from datetime import datetime, timedelta, timezone # Ensure datetime is imported for UserCurriculumProgress
+from datetime import datetime, timedelta, timezone
 from fastapi import FastAPI, HTTPException, Depends
 from fastapi.responses import RedirectResponse
-from sqlalchemy import create_engine, Column, Integer, String, select, ForeignKey, DateTime # Added ForeignKey, DateTime
+from sqlalchemy import create_engine, Column, Integer, String, select, ForeignKey, DateTime, JSON # Added JSON
 from sqlalchemy.orm import Session, sessionmaker
-# from sqlalchemy.orm import relationship # Optional, if relationships are needed later
 from sqlalchemy.ext.declarative import declarative_base
 from jose import jwt, JWTError
 from google.oauth2 import credentials as google_credentials
@@ -20,9 +19,9 @@ import google.generativeai as genai # Added
 from google.generativeai.types import HarmCategory, HarmBlockThreshold # For safety settings
 import os # Already present, but good to ensure
 from itsdangerous import URLSafeTimedSerializer
-import curriculum_utils # Added for curriculum alignment
-
-load_dotenv()
+import curriculum_utils
+import google_api_utils # Added for Google API credential management
+import classroom_service # Added for Google Classroom service functions
 
 # Gemini API Key
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
@@ -62,7 +61,11 @@ class User(Base):
     full_name = Column(String, nullable=True)
     picture_url = Column(String, nullable=True)
     selected_grade_level = Column(String, nullable=True)
-    curriculum_framework = Column(String, nullable=True) # e.g., "Common Core", "StateX"
+    curriculum_framework = Column(String, nullable=True)
+    google_access_token = Column(String, nullable=True)
+    google_refresh_token = Column(String, nullable=True)
+    google_token_expiry = Column(DateTime(timezone=True), nullable=True)
+    google_granted_scopes = Column(JSON, nullable=True)
 
 # Define UserCurriculumProgress Model (SQLAlchemy)
 class UserCurriculumProgress(Base):
@@ -115,17 +118,87 @@ class CurriculumSubject(BaseModel):
     name: str
     grades: Dict[str, Any] # Keeping it flexible
 
+# Pydantic model for Classroom Course (for API response)
+class ClassroomCourseResponse(BaseModel):
+    id: Optional[str] = None
+    name: Optional[str] = None
+    descriptionHeading: Optional[str] = None
+    # teacher: Optional[str] = None # Simplified, current service doesn't provide simple teacher name
+    courseState: Optional[str] = None
+    alternateLink: Optional[str] = None
+
+# Pydantic model for Classroom Assignment (for API response)
+class ClassroomAssignmentResponse(BaseModel):
+    id: Optional[str] = None
+    title: Optional[str] = None
+    description: Optional[str] = None
+    state: Optional[str] = None
+    alternateLink: Optional[str] = None
+    creationTime: Optional[str] = None
+    updateTime: Optional[str] = None
+    dueDate: Optional[str] = None
+    maxPoints: Optional[float] = None
+    workType: Optional[str] = None
+
 app = FastAPI()
 
 @app.get("/api/curriculum", response_model=Dict[str, Any])
 async def get_curriculum_structure(
-    # current_user: User = Depends(get_current_user) # Optional: Protect if needed
+    # current_user: User = Depends(get_current_user)
 ):
     raw_data = curriculum_utils.load_curriculum_data()
     if not raw_data:
-        # Consider returning a 404 or specific error if data is expected but not found
         return {}
     return raw_data
+
+@app.get("/api/classroom/courses", response_model=List[ClassroomCourseResponse])
+async def get_classroom_courses_endpoint(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    google_creds = google_api_utils.get_google_api_credentials(current_user, db)
+    if not google_creds:
+        raise HTTPException(
+            status_code=401,
+            detail="Google API credentials are not available or invalid. Please re-authenticate or grant permissions."
+        )
+
+    # Optional: Check for specific required scopes if needed, though get_google_api_credentials might imply validity
+    # required_scopes = ["https://www.googleapis.com/auth/classroom.courses.readonly"]
+    # if not all(scope in google_creds.scopes for scope in required_scopes):
+    #     raise HTTPException(status_code=403, detail="Missing required Google Classroom permissions for courses.")
+
+    try:
+        courses = classroom_service.get_courses(google_creds)
+        return courses
+    except Exception as e:
+        print(f"Error calling classroom_service.get_courses: {e}")
+        raise HTTPException(status_code=502, detail=f"An error occurred while fetching courses from Google Classroom: {str(e)}")
+
+@app.get("/api/classroom/courses/{course_id}/assignments", response_model=List[ClassroomAssignmentResponse])
+async def get_classroom_course_assignments(
+    course_id: str,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    google_creds = google_api_utils.get_google_api_credentials(current_user, db)
+    if not google_creds:
+        raise HTTPException(
+            status_code=401,
+            detail="Google API credentials are not available or invalid. Please re-authenticate or grant permissions."
+        )
+
+    # Optional: Check for specific required scopes like classroom.coursework.me.readonly
+    # required_scopes = ["https://www.googleapis.com/auth/classroom.coursework.me.readonly"]
+    # if not all(scope in google_creds.scopes for scope in required_scopes):
+    #     raise HTTPException(status_code=403, detail="Missing required Google Classroom permissions for assignments.")
+
+    try:
+        assignments = classroom_service.get_assignments(google_creds, course_id)
+        return assignments
+    except Exception as e:
+        print(f"Error calling classroom_service.get_assignments for course {course_id}: {e}")
+        raise HTTPException(status_code=502, detail=f"An error occurred while fetching assignments for course {course_id}: {str(e)}")
 
 def get_db():
     db = SessionLocal()
@@ -165,17 +238,23 @@ async def login_google(response: StarletteResponse): # Inject Starlette Response
         "auth_uri": "https://accounts.google.com/o/oauth2/auth", "token_uri": "https://oauth2.googleapis.com/token",
         "redirect_uris": [GOOGLE_REDIRECT_URI], "auth_provider_x509_cert_url": "https://www.googleapis.com/oauth2/v1/certs",
     }}
+    current_scopes = [
+        "openid",
+        "https://www.googleapis.com/auth/userinfo.email",
+        "https://www.googleapis.com/auth/userinfo.profile",
+        "https://www.googleapis.com/auth/classroom.courses.readonly",
+        "https://www.googleapis.com/auth/classroom.coursework.me.readonly",
+    ]
     flow = GoogleFlow(
         client_config=client_config,
-        scopes=["openid", "https://www.googleapis.com/auth/userinfo.email", "https://www.googleapis.com/auth/userinfo.profile"],
+        scopes=current_scopes,
         redirect_uri=GOOGLE_REDIRECT_URI
     )
-    # Generate state for CSRF protection
-    oauth_state = os.urandom(16).hex()
     authorization_url, state_from_flow = flow.authorization_url(
         access_type="offline",
+        prompt="consent", # Important to ensure refresh_token
         include_granted_scopes="true",
-        state=oauth_state # Pass our generated state to the flow
+        state=oauth_state
     )
 
     # Store state in a signed, HTTPOnly cookie
@@ -212,42 +291,71 @@ async def auth_google_callback(code: str, state: str, request: FastAPIRequest, d
         raise HTTPException(status_code=400, detail="OAuth state mismatch (CSRF suspected).")
 
     # State is valid, proceed with token fetching
+    # Scopes used here should ideally match or be a subset of those in /login,
+    # or GoogleFlow might complain. For token fetching, only client_config and redirect_uri are strictly needed
+    # if state already encodes enough, but it's safer to be consistent.
+    # The scopes requested during login are what matter for the actual consent and token capabilities.
     client_config = { "web": {
         "client_id": GOOGLE_CLIENT_ID, "client_secret": GOOGLE_CLIENT_SECRET,
         "auth_uri": "https://accounts.google.com/o/oauth2/auth", "token_uri": "https://oauth2.googleapis.com/token",
     }}
+    # Re-construct flow with the same scopes as in /login to be safe, though not strictly necessary for fetch_token
+    # if the redirect_uri is the only thing strictly needed by the library here.
+    # However, the library might use these scopes internally or for validation.
+    current_scopes = [ # Same as in /login
+       "openid",
+       "https://www.googleapis.com/auth/userinfo.email",
+       "https://www.googleapis.com/auth/userinfo.profile",
+       "https://www.googleapis.com/auth/classroom.courses.readonly",
+       "https://www.googleapis.com/auth/classroom.coursework.me.readonly",
+    ]
     flow = GoogleFlow(
         client_config=client_config,
-        scopes=["openid", "https://www.googleapis.com/auth/userinfo.email", "https://www.googleapis.com/auth/userinfo.profile"],
+        scopes=current_scopes,
         redirect_uri=GOOGLE_REDIRECT_URI,
-        state=state # Pass the received state to the flow for some internal checks if any
+        state=state
     )
 
-    response = StarletteResponse() # Create a response object to clear the cookie
+    response = StarletteResponse()
 
     try:
-        flow.fetch_token(code=code) # This call might use the 'state' if library supports it for CSRF at this stage too.
-        credentials = flow.credentials
-        credentials = flow.credentials # Get credentials after successful fetch_token
+        flow.fetch_token(code=code)
 
+        # Store credentials in user object
         user_info_res = requests.get(
             "https://www.googleapis.com/oauth2/v1/userinfo?alt=json",
-            headers={"Authorization": f"Bearer {credentials.token}"})
+            headers={"Authorization": f"Bearer {flow.credentials.token}"})
         user_info_res.raise_for_status()
         user_info = user_info_res.json()
         email = user_info.get("email")
         if not email: raise HTTPException(status_code=400, detail="Email not found in Google profile")
 
         user = db.execute(select(User).where(User.email == email)).scalar_one_or_none()
+
+        # Update or create user
         if user is None:
-            user = User(email=email, full_name=user_info.get("name"), picture_url=user_info.get("picture"))
+            user = User(
+                email=email,
+                full_name=user_info.get("name"),
+                picture_url=user_info.get("picture")
+            )
             db.add(user)
         else:
             user.full_name = user_info.get("name")
             user.picture_url = user_info.get("picture")
-        db.commit(); db.refresh(user)
 
-        access_token = create_access_token(data={"sub": user.email})
+        # Save Google OAuth tokens and scopes to the user
+        if flow.credentials:
+            user.google_access_token = flow.credentials.token
+            if flow.credentials.refresh_token:
+                user.google_refresh_token = flow.credentials.refresh_token
+            user.google_token_expiry = flow.credentials.expiry
+            user.google_granted_scopes = flow.credentials.scopes
+
+        db.commit()
+        db.refresh(user)
+
+        access_token = create_access_token(data={"sub": user.email}) # Internal JWT
 
         # Clear the oauth_state cookie as it's single-use
         response.delete_cookie("oauth_state", httponly=True, samesite="lax", secure=False) # secure=True in prod

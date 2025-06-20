@@ -11,13 +11,14 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')
 # Now, try to import app and get_current_user from main
 # If main.py is structured such that these are not directly importable this way,
 # this part might need adjustment based on actual file structure and exposed members.
-from main import app, get_current_user # Assuming get_current_user is importable
+from main import app, get_current_user, get_db # Assuming these are importable
+from google.oauth2.credentials import Credentials # For type hinting mock
+
+# Import UserCurriculumProgress for type checking if needed, or rely on MagicMock structure
+# from main import UserCurriculumProgress
 
 @pytest.fixture
 def client():
-    # Use TestClient for making requests to the FastAPI app
-    # Ensure that database initialization (create_db_and_tables) is handled appropriately
-    # if it's called at app startup and relies on external DB. For unit tests, it's often mocked/bypassed.
     return TestClient(app)
 
 # Mock for get_current_user dependency
@@ -48,10 +49,12 @@ def test_ask_tutor_success(client, mock_current_active_user, monkeypatch): # Add
     mock_current_active_user.curriculum_framework = "Common Core"
 
     monkeypatch.setattr("main.GEMINI_API_KEY", "test_api_key_ask_success")
-    # No specific curriculum utils mocking needed here if we're just checking prompt content based on user profile
+    # This test will now also involve find_relevant_standards, mock it to return empty
+    monkeypatch.setattr("main.curriculum_utils.find_relevant_standards", MagicMock(return_value=[]))
+
 
     with patch('google.generativeai.GenerativeModel') as mock_generative_model, \
-         patch('google.generativeai.configure') as mock_configure_sdk: # Keep this if main.py configure is called
+         patch('google.generativeai.configure') as mock_configure_sdk:
 
         mock_chat_session = MagicMock()
         mock_gemini_response = MagicMock()
@@ -231,7 +234,8 @@ def test_ask_tutor_no_user_profile_uses_request_grade(client, mock_current_activ
     mock_current_active_user.curriculum_framework = None
 
     monkeypatch.setattr("main.GEMINI_API_KEY", "test_api_key_ask_no_profile")
-    monkeypatch.setattr("main.curriculum_utils.find_relevant_standards", MagicMock(return_value=[])) # No keyword match
+    # Ensure find_relevant_standards is mocked if it's called in this path
+    monkeypatch.setattr("main.curriculum_utils.find_relevant_standards", MagicMock(return_value=[]))
 
     with patch('google.generativeai.GenerativeModel') as mock_generative_model, \
          patch('google.generativeai.configure'):
@@ -414,41 +418,86 @@ def test_update_user_profile_unauthenticated(client, monkeypatch):
 
 
 # Note: The sys.path manipulation and direct import `from main import app, get_current_user`
-# is a common pattern but might need adjustment if the project structure is different,
-# e.g., if `main.py` is not in a directory named `backend` that's a sibling to `tests`'s parent,
-# or if `get_current_user` is not exposed for import.
-# The `autouse=True` on `override_get_current_user` applies it to all tests in this file.
-# This is convenient as all tests for this protected endpoint require user authentication.
-# The `monkeypatch.setattr("main.GEMINI_API_KEY", None)` is used for the no_api_key test
-# to directly modify the module-level variable in the loaded `main` module. This ensures
-# the test accurately reflects the condition where the API key is missing at runtime.
-# Added a check for `system_instruction` in the success test.
-# Added a test for empty response without block reason.
-# Ensured `google.generativeai.configure` is also patched where `GenerativeModel` is patched,
-# as `configure` is called in `main.py` when `GEMINI_API_KEY` is present.
-# Changed fixture name `mock_get_current_user` to `mock_current_active_user` for clarity.
-# Made the `override_get_current_user` fixture `autouse=True` for convenience.
-# Removed `override_env_vars` fixture as it was unused.
-# Removed explicit `app.dependency_overrides = {}` from each test, handled by `override_get_current_user` fixture.
-# Removed `mock_get_current_user` from individual test arguments, as it's handled by autouse fixture.
-# API keys in `monkeypatch.setenv` are made unique per test to avoid potential cross-test interference
-# if the `genai.configure` call had module-level side effects not reset by mocks alone.
-# (Though with proper patching of `genai.configure` itself, this is less of an issue).
-# For `test_ask_tutor_no_api_key`, setting `main.GEMINI_API_KEY = None` is more direct than `delenv`
-# because `main.py` reads `os.getenv` at import time.
-# The `patch('google.generativeai.configure')` is important in tests where `GEMINI_API_KEY` is set,
-# because `main.py` calls `genai.configure(api_key=GEMINI_API_KEY)` if `GEMINI_API_KEY` is truthy.
-# We need to mock this to prevent actual SDK configuration during tests.
-# In `test_ask_tutor_no_api_key`, `genai.configure` should ideally not be called if `GEMINI_API_KEY` is None.
-# The patch for `configure` in `test_ask_tutor_no_api_key` ensures that if it *were* called, it's mocked.
-# It might be more precise to assert `mock_configure.assert_not_called()` in the no_api_key test if `GEMINI_API_KEY` is None.
-# However, the current structure of `main.py` calls `configure` if `GEMINI_API_KEY` (module var) is truthy.
-# So, if `main.GEMINI_API_KEY` is successfully patched to `None`, then `genai.configure` in `main.py`'s top level
-# would not run (or would have run with the original env var before patch).
-# The endpoint itself is what matters: `if not GEMINI_API_KEY:` check within `ask_tutor`.
-# My `monkeypatch.setattr("main.GEMINI_API_KEY", None)` targets this.
-# So `genai.configure` might have been called at module load time (before patch), but the endpoint check is what we test.
-# The patch for `configure` in `no_api_key` test is mostly for safety if the test setup was different.
-# Given `main.GEMINI_API_KEY` is patched, the top-level `genai.configure` in `main.py` has already executed or not.
-# The critical part is the `if not GEMINI_API_KEY:` inside `ask_tutor`.
-# The `mock_configure.assert_called_with(api_key="test_api_key_success")` in success test is good.
+# is a common pattern but might need adjustment if the project structure is different.
+# Autouse fixture for get_current_user is convenient.
+# Patching main.GEMINI_API_KEY directly via monkeypatch.setattr is used for API key tests.
+# Patching main.curriculum_utils.* functions via monkeypatch.setattr is used for curriculum logic tests.
+
+# Tests for Google Classroom API endpoints
+@patch('backend.main.google_api_utils.get_google_api_credentials')
+@patch('backend.main.classroom_service.get_courses')
+def test_get_classroom_courses_success(mock_service_get_courses, mock_get_creds, client, mock_current_active_user):
+    mock_creds_object = MagicMock(spec=Credentials) # Create a mock that matches Credentials spec
+    mock_creds_object.scopes = ["https://www.googleapis.com/auth/classroom.courses.readonly"] # Example scope
+    mock_get_creds.return_value = mock_creds_object
+
+    mock_service_get_courses.return_value = [
+        {"id": "1", "name": "Course A", "descriptionHeading": "Desc A", "courseState": "ACTIVE", "alternateLink": "linkA"},
+    ]
+
+    response = client.get("/api/classroom/courses")
+
+    assert response.status_code == 200
+    json_data = response.json()
+    assert len(json_data) == 1
+    assert json_data[0]["name"] == "Course A"
+    # Assert that get_google_api_credentials was called with the user and a db session
+    mock_get_creds.assert_called_once()
+    # Check first arg of first call (current_user) and type of second arg (db_session)
+    assert mock_get_creds.call_args[0][0] == mock_current_active_user
+    assert hasattr(mock_get_creds.call_args[0][1], 'commit') # Check if it looks like a session
+
+    mock_service_get_courses.assert_called_once_with(mock_creds_object)
+
+
+@patch('backend.main.google_api_utils.get_google_api_credentials')
+def test_get_classroom_courses_no_creds(mock_get_creds, client, mock_current_active_user):
+    mock_get_creds.return_value = None
+
+    response = client.get("/api/classroom/courses")
+    assert response.status_code == 401
+    assert "credentials are not available" in response.json()["detail"].lower()
+
+
+@patch('backend.main.google_api_utils.get_google_api_credentials')
+@patch('backend.main.classroom_service.get_assignments')
+def test_get_classroom_assignments_success(mock_service_get_assignments, mock_get_creds, client, mock_current_active_user):
+    mock_creds_object = MagicMock(spec=Credentials)
+    mock_creds_object.scopes = ["https://www.googleapis.com/auth/classroom.coursework.me.readonly"]
+    mock_get_creds.return_value = mock_creds_object
+
+    mock_service_get_assignments.return_value = [
+        {"id": "as1", "title": "Assignment 1", "dueDate": "2023-12-01"},
+    ]
+
+    test_course_id = "test_course_123"
+    response = client.get(f"/api/classroom/courses/{test_course_id}/assignments")
+
+    assert response.status_code == 200
+    json_data = response.json()
+    assert len(json_data) == 1
+    assert json_data[0]["title"] == "Assignment 1"
+
+    mock_get_creds.assert_called_once()
+    assert mock_get_creds.call_args[0][0] == mock_current_active_user
+
+    mock_service_get_assignments.assert_called_with(mock_creds_object, test_course_id)
+
+@patch('backend.main.google_api_utils.get_google_api_credentials')
+def test_get_classroom_assignments_no_creds(mock_get_creds, client, mock_current_active_user):
+    mock_get_creds.return_value = None
+
+    response = client.get("/api/classroom/courses/any_course_id/assignments")
+    assert response.status_code == 401
+    assert "credentials are not available" in response.json()["detail"].lower()
+
+@patch('backend.main.google_api_utils.get_google_api_credentials')
+@patch('backend.main.classroom_service.get_assignments', side_effect=Exception("Service Error"))
+def test_get_classroom_assignments_service_error(mock_service_get_assignments, mock_get_creds, client, mock_current_active_user):
+    mock_creds_object = MagicMock(spec=Credentials)
+    mock_get_creds.return_value = mock_creds_object
+
+    response = client.get("/api/classroom/courses/course_error_id/assignments")
+    assert response.status_code == 502 # Bad Gateway as per endpoint's error handling
+    assert "error occurred while fetching assignments" in response.json()["detail"].lower()
+    assert "Service Error" in response.json()["detail"]
