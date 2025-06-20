@@ -27,11 +27,14 @@ def mock_current_active_user():
     mock_user = MagicMock()
     mock_user.email = "testuser@example.com"
     mock_user.id = 1
-    mock_user.full_name = "Test User" # Add other fields if accessed by endpoint/dependencies
+    mock_user.full_name = "Test User"
     mock_user.picture_url = "http://example.com/pic.jpg"
+    # Initialize curriculum fields, can be overridden in specific tests
+    mock_user.selected_grade_level = None
+    mock_user.curriculum_framework = None
     return mock_user
 
-# This fixture will apply the dependency override for each test that needs it.
+# This fixture will apply the get_current_user dependency override for each test.
 # Using it as a fixture simplifies test setup.
 @pytest.fixture(autouse=True) # Apply to all tests by default, or specify per test
 def override_get_current_user(mock_current_active_user):
@@ -39,11 +42,15 @@ def override_get_current_user(mock_current_active_user):
     yield
     app.dependency_overrides = {} # Clean up
 
-def test_ask_tutor_success(client, monkeypatch):
-    monkeypatch.setenv("GEMINI_API_KEY", "test_api_key_success")
+def test_ask_tutor_success(client, mock_current_active_user, monkeypatch): # Added mock_current_active_user to args
+    # Configure user profile for this test
+    mock_current_active_user.selected_grade_level = "Grade 5"
+    mock_current_active_user.curriculum_framework = "Common Core"
+
+    monkeypatch.setattr("main.GEMINI_API_KEY", "test_api_key_ask_success")
 
     with patch('google.generativeai.GenerativeModel') as mock_generative_model, \
-         patch('google.generativeai.configure') as mock_configure: # Patch configure as well
+         patch('google.generativeai.configure') as mock_configure_sdk:
 
         mock_chat_session = MagicMock()
         mock_gemini_response = MagicMock()
@@ -72,42 +79,63 @@ def test_ask_tutor_success(client, monkeypatch):
         # Check that system_instruction was passed during GenerativeModel initialization
         args, kwargs = mock_generative_model.call_args
         assert 'system_instruction' in kwargs
-        assert "elementary" in kwargs['system_instruction'] # Check grade level in system prompt
+        # Assert that user's profile settings are in the system prompt
+        assert "student is in Grade 5" in kwargs['system_instruction']
+        assert "following the Common Core curriculum" in kwargs['system_instruction']
 
         mock_model_instance.start_chat.assert_called_once_with(history=[])
         mock_chat_session.send_message.assert_called_with("Hello tutor")
 
+def test_ask_tutor_no_user_profile_uses_request_grade(client, mock_current_active_user, monkeypatch):
+    mock_current_active_user.selected_grade_level = None
+    mock_current_active_user.curriculum_framework = None
 
-def test_ask_tutor_no_api_key(client, monkeypatch):
-    # Ensure GEMINI_API_KEY is not effectively set for the app's context for this test
-    # main.py loads GEMINI_API_KEY at module level.
-    # To test this, we need to simulate the key not being available when genai.configure is called,
-    # or not present when the endpoint logic checks for GEMINI_API_KEY.
-    # The current check `if not GEMINI_API_KEY:` relies on the module-level variable.
-    # Monkeypatching os.getenv used by main.py for GEMINI_API_KEY is tricky if it's already loaded.
-    # A robust way is to patch the 'GEMINI_API_KEY' variable directly in the 'main' module.
+    monkeypatch.setattr("main.GEMINI_API_KEY", "test_api_key_ask_no_profile")
 
-    # If main.py is `import os; GEMINI_API_KEY = os.getenv(...)`, then patching os.getenv might not re-evaluate.
-    # Patching the variable `main.GEMINI_API_KEY` if it's accessible.
-    # For this test, we assume the endpoint re-checks or the initial configuration fails.
-    # The simplest for the test is to ensure the `GEMINI_API_KEY` variable in `main` module scope is None or empty.
+    with patch('google.generativeai.GenerativeModel') as mock_generative_model, \
+         patch('google.generativeai.configure'):
 
-    monkeypatch.setattr("main.GEMINI_API_KEY", None) # Patch the variable in the loaded main module
-    # Also, prevent genai.configure from running with a None key if it would raise an error early
-    with patch('google.generativeai.configure') as mock_configure:
+        mock_chat_session = MagicMock()
+        mock_gemini_response = MagicMock()
+        mock_gemini_response.text = "Reply for elementary."
+        mock_gemini_response.parts = [MagicMock(text="Reply for elementary.")]
+        mock_gemini_response.prompt_feedback = None
+        mock_chat_session.send_message.return_value = mock_gemini_response
+        mock_model_instance = MagicMock()
+        mock_model_instance.start_chat.return_value = mock_chat_session
+        mock_generative_model.return_value = mock_model_instance
+
         response = client.post(
             "/api/askTutor",
-            json={"query": "Test query", "history": []},
+            json={"query": "Hello", "history": [], "grade_level": "elementary school"}, # Fallback grade in request
+            headers={"Authorization": "Bearer testtoken"}
+        )
+        assert response.status_code == 200
+        json_response = response.json()
+        assert json_response["reply"] == "Reply for elementary."
+
+        args, kwargs = mock_generative_model.call_args
+        assert 'system_instruction' in kwargs
+        assert "student is in elementary school" in kwargs['system_instruction']
+        assert "curriculum" not in kwargs['system_instruction'].lower() # No framework mentioned
+
+
+def test_ask_tutor_no_api_key(client, monkeypatch):
+    monkeypatch.setattr("main.GEMINI_API_KEY", None)
+    with patch('google.generativeai.configure'): # Ensure configure is mocked if it's called at module level
+        response = client.post(
+            "/api/askTutor",
+            json={"query": "Test query", "history": []}, # grade_level is optional
             headers={"Authorization": "Bearer testtoken"}
         )
         assert response.status_code == 500
         assert "Gemini API key not configured" in response.json()["detail"]
 
 def test_ask_tutor_gemini_error_blocked(client, monkeypatch):
-    monkeypatch.setenv("GEMINI_API_KEY", "test_api_key_blocked")
+    monkeypatch.setattr("main.GEMINI_API_KEY", "test_api_key_blocked")
 
     with patch('google.generativeai.GenerativeModel') as mock_generative_model, \
-         patch('google.generativeai.configure'): # Mock configure
+         patch('google.generativeai.configure'):
 
         mock_chat_session = MagicMock()
         mock_gemini_response = MagicMock()
@@ -131,10 +159,10 @@ def test_ask_tutor_gemini_error_blocked(client, monkeypatch):
 
 
 def test_ask_tutor_gemini_generic_exception(client, monkeypatch):
-    monkeypatch.setenv("GEMINI_API_KEY", "test_api_key_exception")
+    monkeypatch.setattr("main.GEMINI_API_KEY", "test_api_key_exception")
 
     with patch('google.generativeai.GenerativeModel') as mock_generative_model, \
-         patch('google.generativeai.configure'): # Mock configure
+         patch('google.generativeai.configure'):
 
         mock_model_instance = MagicMock()
         mock_model_instance.start_chat.side_effect = Exception("Unexpected Gemini SDK error")
@@ -150,7 +178,7 @@ def test_ask_tutor_gemini_generic_exception(client, monkeypatch):
         assert "Unexpected Gemini SDK error" in response.json()["detail"]
 
 def test_ask_tutor_empty_response_no_block_reason(client, monkeypatch):
-    monkeypatch.setenv("GEMINI_API_KEY", "test_api_key_empty_no_block")
+    monkeypatch.setattr("main.GEMINI_API_KEY", "test_api_key_empty_no_block")
 
     with patch('google.generativeai.GenerativeModel') as mock_generative_model, \
          patch('google.generativeai.configure'):
@@ -173,6 +201,75 @@ def test_ask_tutor_empty_response_no_block_reason(client, monkeypatch):
         )
         assert response.status_code == 500
         assert "Received an empty response from the AI" in response.json()["detail"]
+
+# Tests for /api/users/me/profile PUT endpoint
+def test_update_user_profile_success(client, mock_current_active_user, monkeypatch):
+    # Ensure the mock user allows attribute assignment for the fields being updated
+    mock_current_active_user.selected_grade_level = "Initial Grade"
+    mock_current_active_user.curriculum_framework = "Initial Framework"
+
+    update_data = {
+        "selected_grade_level": "Updated Grade 5",
+        "curriculum_framework": "Updated Common Core"
+    }
+
+    # Mock db session if needed for commit/refresh, though TestClient often handles this for simple cases.
+    # For this test, we assume the endpoint's db operations on current_user (mocked) are sufficient.
+
+    response = client.put(
+        "/api/users/me/profile",
+        json=update_data,
+        headers={"Authorization": "Bearer testtoken"}
+    )
+
+    assert response.status_code == 200
+    json_response = response.json()
+
+    assert json_response["selected_grade_level"] == "Updated Grade 5"
+    assert json_response["curriculum_framework"] == "Updated Common Core"
+
+    # Verify that the mock_current_active_user object was actually updated
+    assert mock_current_active_user.selected_grade_level == "Updated Grade 5"
+    assert mock_current_active_user.curriculum_framework == "Updated Common Core"
+
+def test_update_user_profile_partial_update(client, mock_current_active_user, monkeypatch):
+    mock_current_active_user.selected_grade_level = "Grade 8"
+    mock_current_active_user.curriculum_framework = "Old Framework" # This should persist
+
+    update_data = {
+        "selected_grade_level": "Grade 9"
+        # curriculum_framework is not provided, so it should not change
+    }
+
+    response = client.put(
+        "/api/users/me/profile",
+        json=update_data,
+        headers={"Authorization": "Bearer testtoken"}
+    )
+    assert response.status_code == 200
+    json_response = response.json()
+
+    assert json_response["selected_grade_level"] == "Grade 9"
+    assert json_response["curriculum_framework"] == "Old Framework" # Assert it remained unchanged
+
+    assert mock_current_active_user.selected_grade_level == "Grade 9"
+    assert mock_current_active_user.curriculum_framework == "Old Framework"
+
+
+def test_update_user_profile_unauthenticated(client, monkeypatch):
+    # Temporarily remove the global dependency override for this test
+    app.dependency_overrides = {}
+
+    response = client.put(
+        "/api/users/me/profile",
+        json={"selected_grade_level": "Unauth Grade"}
+        # No Authorization header
+    )
+    assert response.status_code == 401 # Expecting 401 due to missing token / failed auth
+
+    # Restore the override for other tests if not using autouse=True on a specific fixture for cleanup
+    # Note: The autouse=True fixture `override_get_current_user` will re-apply itself for the next test.
+
 
 # Note: The sys.path manipulation and direct import `from main import app, get_current_user`
 # is a common pattern but might need adjustment if the project structure is different,

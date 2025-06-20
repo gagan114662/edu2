@@ -1,0 +1,40 @@
+{
+  "Math": {
+    "Grade 5": {
+      "Common Core": {
+        "Number & Operations in Base Ten": {
+          "CCSS.MATH.CONTENT.5.NBT.A.1": {
+            "description": "Recognize that in a multi-digit number, a digit in one place represents 10 times as much as it represents in the place to its right and 1/10 of what it represents in the place to its left.",
+            "keywords": ["place value", "decimal", "base ten"]
+          },
+          "CCSS.MATH.CONTENT.5.NBT.A.2": {
+            "description": "Explain patterns in the number of zeros of the product when multiplying a number by powers of 10, and explain patterns in the placement of the decimal point when a decimal is multiplied or divided by a power of 10. Use whole-number exponents to denote powers of 10.",
+            "keywords": ["powers of 10", "multiplication", "division", "decimal point", "exponents"]
+          }
+        },
+        "Fractions": {
+          "CCSS.MATH.CONTENT.5.NF.A.1": {
+            "description": "Add and subtract fractions with unlike denominators (including mixed numbers) by replacing given fractions with equivalent fractions in such a way as to produce an equivalent sum or difference of fractions with like denominators.",
+            "keywords": ["add fractions", "subtract fractions", "unlike denominators", "mixed numbers", "equivalent fractions"]
+          },
+          "CCSS.MATH.CONTENT.5.NF.B.3": {
+            "description": "Interpret a fraction as division of the numerator by the denominator (a/b = a ÷ b). Solve word problems involving division of whole numbers leading to answers in the form of fractions or mixed numbers, e.g., by using visual fraction models or equations to represent the problem.",
+            "keywords": ["fraction as division", "word problems", "visual models"]
+          }
+        }
+      }
+    }
+  },
+  "English Language Arts": {
+    "Grade 5": {
+      "Common Core": {
+        "Reading: Literature": {
+          "CCSS.ELA-LITERACY.RL.5.1": {
+            "description": "Quote accurately from a text when explaining what the text says explicitly and when drawing inferences from the text.",
+            "keywords": ["quote accurately", "inferences", "textual evidence"]
+          }
+        }
+      }
+    }
+  }
+}

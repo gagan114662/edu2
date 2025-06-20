@@ -47,11 +47,15 @@ This project implements an AI-powered tutoring system with a web-based chat inte
         *   `JWT_SECRET_KEY`: A strong secret key for JWTs.
         *   `FRONTEND_URL`: The URL where your frontend is running (e.g., `http://localhost:3000`).
         *   **`GEMINI_API_KEY`**: Your API key for the Gemini AI model. This is required for the AI tutor functionality.
+    *   Note: The User profile in the database now also stores `selected_grade_level` and `curriculum_framework` for curriculum alignment features.
 
-5.  **Run database migrations (if applicable):**
-    *   The current application creates tables on startup if they don't exist (`Base.metadata.create_all(bind=engine)` in `main.py`). Ensure your database is running and accessible.
+5.  **Curriculum Data:**
+    *   The backend uses a `backend/curriculum_data.json` file to store curriculum structures (subjects, grades, frameworks, topics, standards). This file is loaded at runtime to provide context to the AI tutor. The basic structure is: `Subject -> Grade -> Framework -> Topic -> StandardID: {description, keywords}`.
 
-6.  **Start the backend server:**
+6.  **Run database migrations (if applicable):**
+    *   The current application creates tables on startup if they don't exist (`Base.metadata.create_all(bind=engine)` in `main.py`). This includes the `users` table (with new profile fields) and the `user_curriculum_progress` table. Ensure your database is running and accessible.
+
+7.  **Start the backend server:**
     ```bash
     uvicorn main:app --reload --port 8000
     ```
@@ -75,12 +79,31 @@ This project implements an AI-powered tutoring system with a web-based chat inte
     ```
     The frontend should now be running on `http://localhost:3000` and will connect to the backend server.
 
+## API Overview
+
+### User Profile API
+*   `GET /api/users/me`: Returns current user's details, now including `selected_grade_level` and `curriculum_framework`.
+*   `PUT /api/users/me/profile`: Updates the current user's profile. Request body can include:
+    *   `selected_grade_level` (string, optional)
+    *   `curriculum_framework` (string, optional)
+
+### AI Tutor API
+*   `POST /api/askTutor`: This endpoint now leverages the `selected_grade_level` and `curriculum_framework` from the user's profile to provide curriculum-aligned responses. It also includes basic progress tagging for practiced curriculum standards (stored in `user_curriculum_progress` table).
+
 ## AI Tutor Feature
 
 The AI tutor uses the Google Gemini API to generate responses. Ensure your `GEMINI_API_KEY` is correctly set in the backend's `.env` file for this feature to work.
 
-The tutor is designed to:
+The AI tutor now aligns its responses with K-12 curriculum standards based on the student's profile settings.
+Key enhancements include:
+*   **Curriculum-Aware Prompts:** The system uses the `selected_grade_level` and `curriculum_framework` (e.g., "Grade 5", "Common Core Math") from the user's profile to tailor the AI's persona and instructions.
+*   **Content Relevance:** The AI is instructed to stay within the scope of the specified curriculum, gently redirecting off-topic queries.
+*   **Curriculum Data:** A `curriculum_data.json` file provides the structural information for subjects, grades, topics, and standards used for context.
+*   **Progress Tagging (Basic):** The system includes a mechanism to log curriculum standards that have been "practiced" during tutoring sessions. This is stored in the `user_curriculum_progress` table in the database. (Note: Specific standard identification from queries is currently basic and will be enhanced in future iterations).
+
+The tutor is also designed to:
 *   Understand student queries.
-*   Provide age-appropriate explanations (currently defaults to "middle school" level, configurable in future).
+*   Provide age-appropriate explanations.
 *   Maintain conversation context.
 *   Adhere to content safety guidelines via Gemini API's built-in filters.
+```

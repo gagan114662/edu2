@@ -8,7 +8,7 @@ const ChatInterface = () => {
     const [inputText, setInputText] = useState('');
     const [isLoading, setIsLoading] = useState(false);
     const [error, setError] = useState(null);
-    const { token } = useAuth();
+    const { token, user } = useAuth(); // Destructure user as well
 
     const messagesEndRef = useRef(null);
 
@@ -47,7 +47,7 @@ const ChatInterface = () => {
                 body: JSON.stringify({
                     query: currentQuery,
                     history: historyForAPI,
-                    grade_level: 'middle school'
+                    grade_level: (user && user.selected_grade_level) ? user.selected_grade_level : 'middle school' // Use dynamic grade_level
                 }),
             });
 
