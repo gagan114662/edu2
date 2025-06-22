@@ -2,33 +2,60 @@
 import React, { useState, useRef, useEffect, useCallback } from 'react';
 import { useAuth } from '../context/AuthContext';
 import { useNavigate } from 'react-router-dom';
+import axios from 'axios';
 
 // Import Child UI Components
 import UserProfileDisplay from '../components/UserProfileDisplay';
 import VoiceControls from '../components/VoiceControls';
 import TranscriptView from '../components/TranscriptView';
+import VoiceDebug from '../components/VoiceDebug';
 
 // Import Custom Hooks
 import useMicrophone from '../hooks/useMicrophone';
 import useVoiceSocket from '../hooks/useVoiceSocket';
+import useSpeechRecognition from '../hooks/useSpeechRecognition';
+import useTextToSpeech from '../hooks/useTextToSpeech';
 
 const HomePage = () => {
-    const { user, isAuthenticated, isLoadingAuth, logout } = useAuth(); // Removed getIdToken if not directly used here
+    const { user, isAuthenticated, isLoadingAuth, logout, getIdToken } = useAuth();
     const navigate = useNavigate();
 
     // --- States managed by HomePage (or derived from hooks) ---
     const [statusMessage, setStatusMessage] = useState("Idle. Click 'Start Talking' to speak.");
     const [conversationTranscript, setConversationTranscript] = useState([]);
     const [tutorIsSpeaking, setTutorIsSpeaking] = useState(false); // Overall tutor speaking status
+    const [currentTopic, setCurrentTopic] = useState('General'); // Track current topic for progress
 
     // Refs for audio playback (still managed by HomePage for now)
     const playbackAudioContextRef = useRef(null); // Separate AudioContext for playback
     const audioQueueRef = useRef([]);
     const [isPlayingAudio, setIsPlayingAudio] = useState(false);
     const audioPlaybackNodeRef = useRef(null);
+    const sessionStartTimeRef = useRef(null); // Track session start time
 
     const TARGET_SAMPLE_RATE = 16000;
-    const BACKEND_WS_URL = process.env.REACT_APP_BACKEND_WS_URL || 'ws://localhost:8000/ws/voice_tutor';
+    const BACKEND_WS_URL = process.env.REACT_APP_BACKEND_WS_URL || 'ws://127.0.0.1:8000/ws/voice_tutor';
+    
+    // Debug logging (only log once)
+    useEffect(() => {
+        console.log('Voice Tutor initialized with WebSocket URL:', BACKEND_WS_URL);
+    }, [BACKEND_WS_URL]);
+
+    // --- Progress Tracking Functions ---
+    const logProgressEvent = useCallback(async (eventType, eventData = null) => {
+        try {
+            const token = await getIdToken();
+            await axios.post('http://127.0.0.1:8000/api/progress/log_event', {
+                event_type: eventType,
+                event_data: eventData,
+                timestamp_client: new Date().toISOString()
+            }, {
+                headers: { 'Authorization': `Bearer ${token}` }
+            });
+        } catch (error) {
+            console.error('Failed to log progress event:', error);
+        }
+    }, [getIdToken]);
 
     // --- Logic for Audio Playback (remains in HomePage for now) ---
     const processAudioQueueInternal = useCallback(async () => {
@@ -104,27 +131,40 @@ const HomePage = () => {
 
     const handleWebSocketConnectionChange = useCallback((connState, isUnexpected) => {
         if (connState === 'connected') {
+            // Log session start when connected
+            sessionStartTimeRef.current = Date.now();
+            logProgressEvent('SESSION_START', { sessionType: 'voice', topic: currentTopic });
             // This status might be overridden by mic status or listening status later
             // setStatusMessage("Connected to voice service.");
         } else if (connState === 'disconnected') {
-            setStatusMessage(isUnexpected ? "Disconnected unexpectedly. Click 'Start Talking' to reconnect." : "Disconnected. Click 'Start Talking' to reconnect.");
-            // If disconnected, ensure we stop listening locally
-            if (isListening) { // isListening from useMicrophone hook
-                stopRecording(); // This will also update mic states
+            // Log session end when disconnected
+            if (sessionStartTimeRef.current) {
+                const duration = Math.round((Date.now() - sessionStartTimeRef.current) / 1000);
+                logProgressEvent('SESSION_END', { 
+                    sessionDurationSeconds: duration,
+                    sessionType: 'voice',
+                    topic: currentTopic 
+                });
+                sessionStartTimeRef.current = null;
             }
+            setStatusMessage(isUnexpected ? "Disconnected unexpectedly. Click 'Start Talking' to reconnect." : "Disconnected. Click 'Start Talking' to reconnect.");
         } else if (connState === 'error') {
             setStatusMessage("Voice service connection error.");
         } else if (connState === 'connecting') {
             setStatusMessage("Connecting to voice service...");
         }
-    }, []); // Removed isListening and stopRecording as they come from another hook
+    }, [logProgressEvent, currentTopic]);
 
+
+    // Text-to-speech hook
+    const { speak, stop: stopSpeech, isSpeaking: isTTSSpeaking } = useTextToSpeech();
 
     const {
         connectionState,
         connectSocket,
         disconnectSocket,
-        sendAudioData
+        sendAudioData,
+        sendTranscript
     } = useVoiceSocket(
         BACKEND_WS_URL,
         useCallback((audioChunk) => {
@@ -133,17 +173,105 @@ const HomePage = () => {
         }, [isPlayingAudio, processAudioQueueInternal]),
         useCallback((transcriptEntry) => {
             setConversationTranscript(prev => [...prev, transcriptEntry]);
-        }, []),
+            
+            // Use TTS for tutor responses (fallback if no audio from Gemini Live API)
+            if (transcriptEntry.speaker === 'tutor' || transcriptEntry.speaker === 'assistant') {
+                console.log('🔊 Triggering TTS for tutor response:', transcriptEntry.text);
+                
+                // Use TTS as fallback - Gemini Live API audio takes precedence if available
+                setTimeout(() => {
+                    console.log('🔊 Calling speak function now');
+                    speak(transcriptEntry.text);
+                }, 100); // Small delay to allow audio chunks
+            }
+            
+            // Detect question answering patterns in tutor responses
+            if (transcriptEntry.speaker === 'assistant' || transcriptEntry.speaker === 'tutor') {
+                const lowerContent = transcriptEntry.text.toLowerCase();
+                // Simple heuristic: if tutor mentions "correct", "good job", "well done", etc.
+                if (lowerContent.includes('correct') || lowerContent.includes('good job') || 
+                    lowerContent.includes('well done') || lowerContent.includes('that\'s right')) {
+                    logProgressEvent('QUESTION_ANSWERED', {
+                        topicName: currentTopic,
+                        isCorrect: true,
+                        sessionType: 'voice'
+                    });
+                }
+            }
+        }, [logProgressEvent, currentTopic, speak]),
         useCallback((isSpeaking) => {
-            setTutorIsSpeaking(isSpeaking);
+            setTutorIsSpeaking(isSpeaking || isTTSSpeaking);
             // Status message update for tutor speaking is now handled in the main useEffect for status
-        }, []),
+        }, [isTTSSpeaking]),
         handleWebSocketError, // Use the memoized error handler
         handleWebSocketConnectionChange // Use the memoized connection state handler
     );
 
+    // Track if we should be listening
+    const [shouldListen, setShouldListen] = useState(false);
+
+    // Speech recognition hook
     const {
-        isListening,
+        isListening: isSpeechListening,
+        isSupported: isSpeechSupported,
+        error: speechError,
+        startRecognition,
+        stopRecognition
+    } = useSpeechRecognition(
+        useCallback((transcript) => {
+            console.log('Speech recognized:', transcript);
+            console.log('Current connection state:', connectionState);
+            if (connectionState === 'connected') {
+                // Add user transcript to conversation
+                setConversationTranscript(prev => [...prev, {
+                    speaker: 'user',
+                    text: transcript
+                }]);
+                // Send to backend
+                sendTranscript(transcript);
+                console.log('Transcript sent to backend:', transcript);
+            } else {
+                console.log(`WebSocket not connected (state: ${connectionState}), speech ignored`);
+            }
+        }, [connectionState, sendTranscript]),
+        shouldListen // Pass shouldListen as isActive
+    );
+    
+    // Debug speech recognition state occasionally
+    useEffect(() => {
+        if (speechError) {
+            console.log('Speech recognition error:', speechError);
+        }
+    }, [speechError]);
+    
+    // Handle TTS feedback loop prevention with debouncing
+    useEffect(() => {
+        let timeoutId;
+        
+        if (isTTSSpeaking && isSpeechListening && isSpeechSupported) {
+            console.log('🔇 Pausing speech recognition for TTS');
+            stopRecognition();
+        } else if (!isTTSSpeaking && shouldListen && !isSpeechListening && isSpeechSupported) {
+            console.log('🎤 Will restart speech recognition after TTS finished');
+            // Use longer delay and clear any existing timeout
+            timeoutId = setTimeout(() => {
+                if (!isTTSSpeaking && shouldListen && !isSpeechListening && isSpeechSupported) {
+                    console.log('🎤 Actually restarting speech recognition now');
+                    startRecognition();
+                }
+            }, 1000); // Longer delay to ensure TTS is completely finished
+        }
+        
+        return () => {
+            if (timeoutId) {
+                clearTimeout(timeoutId);
+            }
+        };
+    }, [isTTSSpeaking, shouldListen, isSpeechListening, isSpeechSupported, startRecognition, stopRecognition]);
+
+    // Keep microphone for compatibility but use speech recognition primarily
+    const {
+        isListening: isMicListening,
         isMicConnecting,
         micError,
         startRecording,
@@ -155,6 +283,9 @@ const HomePage = () => {
             }
         }, [connectionState, sendAudioData])
     );
+
+    // Use speech recognition as primary listening method
+    const isListening = isSpeechSupported ? isSpeechListening : isMicListening;
 
     // Update the handleWebSocketConnectionChange to include stopRecording from useMicrophone
     // This needs to be done carefully due to useCallback dependencies.
@@ -172,28 +303,50 @@ const HomePage = () => {
     // --- Combined State Logic & Event Handlers for UI ---
 
     const isOverallConnecting = isMicConnecting || connectionState === 'connecting';
-    const currentDisplayError = micError || (connectionState === 'error' ? "Voice service connection error." : null);
+    const currentDisplayError = speechError || micError || (connectionState === 'error' ? "Voice service connection error." : null);
 
     const handleToggleListen = useCallback(async () => {
-        if (isListening) { // If microphone is listening
-            await stopRecording(); // Stop microphone first
-            // Consider if WebSocket should be disconnected immediately or wait for server
-            // For now, we assume user stopping listening means they want to end the WS session too.
+        if (isListening) { 
+            // Stop listening
+            setShouldListen(false);
+            
+            if (isSpeechSupported) {
+                stopRecognition();
+            } else {
+                await stopRecording();
+            }
+            
+            // Stop TTS if speaking
+            stopSpeech();
+            
+            // Disconnect WebSocket
             if (connectionState === 'connected' || connectionState === 'connecting') {
                 disconnectSocket(1000, "User stopped listening via UI toggle.");
             }
             setStatusMessage("Idle. Click 'Start Talking' to speak.");
-        } else { // Not listening, try to start
+        } else { 
+            // Start listening
             setConversationTranscript([]);
             audioQueueRef.current = [];
             setIsPlayingAudio(false);
             setTutorIsSpeaking(false);
-            // setStatusMessage("Initiating..."); // This will be set by hooks
-            // Mic error is cleared by useMicrophone's startRecording
-            await startRecording();
-            // useEffect below will attempt to connect socket if mic started successfully
+            
+            // Connect WebSocket first
+            if (connectionState !== 'connected' && connectionState !== 'connecting') {
+                connectSocket();
+            }
+            
+            // Enable speech recognition
+            setShouldListen(true);
+            
+            // Start listening - use speech recognition if supported
+            if (isSpeechSupported) {
+                startRecognition();
+            } else {
+                await startRecording();
+            }
         }
-    }, [isListening, stopRecording, startRecording, connectionState, disconnectSocket]);
+    }, [isListening, isSpeechSupported, stopRecognition, stopRecording, startRecognition, startRecording, connectionState, disconnectSocket, connectSocket, stopSpeech]);
 
     useEffect(() => {
         // If mic started successfully (isListening is true) and socket isn't connected/connecting, then connect.
@@ -262,19 +415,23 @@ const HomePage = () => {
             </header>
 
             <main className="flex flex-col items-center flex-grow p-4 w-full">
-                <div className="w-full max-w-2xl bg-white p-6 rounded-lg shadow-xl">
-                    <h1 className="text-2xl font-bold mb-6 text-center text-gray-700">AI Voice Tutor</h1>
+                <div className="w-full max-w-2xl space-y-4">
+                    <VoiceDebug />
+                    
+                    <div className="bg-white p-6 rounded-lg shadow-xl">
+                        <h1 className="text-2xl font-bold mb-6 text-center text-gray-700">AI Voice Tutor</h1>
 
-                    <VoiceControls
-                        isListening={isListening}
-                        isConnecting={isOverallConnecting}
-                        tutorIsSpeaking={tutorIsSpeaking}
-                        statusMessage={statusMessage}
-                        micError={currentDisplayError}
-                        onToggleListen={handleToggleListen}
-                    />
+                        <VoiceControls
+                            isListening={isListening}
+                            isConnecting={isOverallConnecting}
+                            tutorIsSpeaking={tutorIsSpeaking}
+                            statusMessage={statusMessage}
+                            micError={currentDisplayError}
+                            onToggleListen={handleToggleListen}
+                        />
 
-                    <TranscriptView transcript={conversationTranscript} />
+                        <TranscriptView transcript={conversationTranscript} />
+                    </div>
                 </div>
             </main>
             <footer className="text-center p-4 text-sm text-gray-500">
@@ -285,4 +442,3 @@ const HomePage = () => {
 };
 
 export default HomePage;
-```

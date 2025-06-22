@@ -2,29 +2,47 @@ import React from 'react';
 import { BrowserRouter as Router, Routes, Route } from 'react-router-dom';
 import LoginPage from './pages/LoginPage';
 import HomePage from './pages/HomePage';
-// AuthCallbackPage is removed
+import ProgressDashboardPage from './pages/ProgressDashboardPage';
+import CurriculumPage from './pages/CurriculumPage';
+import ChatPage from './pages/ChatPage';
+import SettingsPage from './pages/SettingsPage';
+import ParentDashboardPage from './pages/ParentDashboardPage';
+import Navigation from './components/Navigation';
 import ProtectedRoute from './components/ProtectedRoute';
-import ProgressDashboardPage from './pages/ProgressDashboardPage'; // Import the new page
+import { useAuth } from './context/AuthContext';
 import './App.css';
 
 function App() {
+  const { user } = useAuth();
+
   return (
     <Router>
-      <Routes>
-        <Route path="/login" element={<LoginPage />} />
-        {/* The /auth/callback route is no longer needed with Firebase a uth handling the redirect flow */}
-        {/* <Route path="/auth/callback" element={<AuthCallbackPage />} /> */}
+      <div className="min-h-screen bg-gray-100">
+        {user && <Navigation />}
+        <Routes>
+          <Route path="/login" element={<LoginPage />} />
 
-        {/* Protected Routes: */}
-        <Route element={<ProtectedRoute />}>
-          <Route path="/" element={<HomePage />} />
-          <Route path="/dashboard" element={<ProgressDashboardPage />} /> {/* Add new dashboard route */}
-          {/* Add other protected routes here as children of ProtectedRoute */}
-        </Route>
+          {/* Protected Routes: */}
+          <Route element={<ProtectedRoute />}>
+            <Route path="/" element={<HomePage />} />
+            <Route path="/dashboard" element={<ProgressDashboardPage />} />
+            <Route path="/curriculum" element={<CurriculumPage />} />
+            <Route path="/chat" element={<ChatPage />} />
+            <Route path="/settings" element={<SettingsPage />} />
+            <Route path="/parent-dashboard" element={<ParentDashboardPage />} />
+          </Route>
 
-        {/* You can add a 404 Not Found page here */}
-        {/* <Route path="*" element={<NotFoundPage />} /> */}
-      </Routes>
+          {/* 404 Not Found page */}
+          <Route path="*" element={
+            <div className="min-h-screen flex items-center justify-center">
+              <div className="text-center">
+                <h1 className="text-4xl font-bold text-gray-800 mb-4">404</h1>
+                <p className="text-gray-600">Page not found</p>
+              </div>
+            </div>
+          } />
+        </Routes>
+      </div>
     </Router>
   );
 }

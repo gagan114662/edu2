@@ -20,10 +20,25 @@ let auth;
 let googleAuthProvider;
 
 try {
+  console.log("Firebase config:", {
+    apiKey: firebaseConfig.apiKey ? "Present" : "Missing",
+    authDomain: firebaseConfig.authDomain,
+    projectId: firebaseConfig.projectId,
+    storageBucket: firebaseConfig.storageBucket,
+    messagingSenderId: firebaseConfig.messagingSenderId,
+    appId: firebaseConfig.appId ? "Present" : "Missing"
+  });
+  
   app = initializeApp(firebaseConfig);
   auth = getAuth(app);
   googleAuthProvider = new GoogleAuthProvider();
+  
+  // Add additional scopes if needed
+  googleAuthProvider.addScope('email');
+  googleAuthProvider.addScope('profile');
+  
   console.log("Firebase initialized successfully with provided config.");
+  console.log("Project ID:", firebaseConfig.projectId);
 } catch (error) {
   console.error("Firebase initialization error:", error);
   // Handle cases where Firebase config might be missing or invalid,

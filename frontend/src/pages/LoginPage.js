@@ -18,12 +18,33 @@ const LoginPage = () => {
     const handleGoogleSignIn = async () => {
         setError(null); // Clear previous errors
         try {
-            await signInWithPopup(auth, googleAuthProvider);
+            console.log("Attempting Google Sign-in...");
+            console.log("Auth object:", auth);
+            console.log("Google provider:", googleAuthProvider);
+            
+            const result = await signInWithPopup(auth, googleAuthProvider);
+            console.log("Sign-in successful:", result.user);
             // onAuthStateChanged in AuthContext will handle navigation or state update
             // No explicit navigation here is needed after successful signInWithPopup
         } catch (err) {
             console.error("Firebase Sign-In Error: ", err);
-            setError(`Failed to sign in: ${err.message}`); // Display error to user
+            console.error("Error code:", err.code);
+            console.error("Error message:", err.message);
+            
+            let errorMessage = `Failed to sign in: ${err.message}`;
+            
+            // Provide specific guidance for common errors
+            if (err.code === 'auth/operation-not-allowed') {
+                errorMessage = "Google Sign-in is not enabled. Please check Firebase Console: Authentication → Sign-in method → Google (make sure it's enabled and support email is set)";
+            } else if (err.code === 'auth/unauthorized-domain') {
+                errorMessage = "This domain is not authorized. Please add your domain to Firebase Console: Authentication → Sign-in method → Authorized domains";
+            } else if (err.code === 'auth/popup-blocked') {
+                errorMessage = "Popup was blocked by browser. Please allow popups for this site and try again.";
+            } else if (err.code === 'auth/popup-closed-by-user') {
+                errorMessage = "Sign-in was cancelled. Please try again.";
+            }
+            
+            setError(errorMessage);
         }
     };
 

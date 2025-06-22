@@ -26,14 +26,34 @@ const useVoiceSocket = (
       console.log("useVoiceSocket: WebSocket already open or connecting.");
       return;
     }
+    
+    console.log(`useVoiceSocket: Attempting to connect to ${backendWsUrl}`);
     updateConnectionState('connecting');
     if(onTranscriptUpdate) onTranscriptUpdate({speaker: 'system', text: 'Connecting to voice service...'});
 
-
-    webSocketRef.current = new WebSocket(backendWsUrl);
+    try {
+      webSocketRef.current = new WebSocket(backendWsUrl);
+      console.log("useVoiceSocket: WebSocket object created successfully");
+    } catch (error) {
+      console.error("useVoiceSocket: Failed to create WebSocket:", error);
+      updateConnectionState('error');
+      if(onErrorChange) onErrorChange(`Failed to create WebSocket connection: ${error.message}`);
+      return;
+    }
 
     webSocketRef.current.onopen = () => {
       console.log("useVoiceSocket: WebSocket connected.");
+      
+      // Send initial setup message for Gemini Live API
+      const setupMessage = {
+        setup: {
+          model: "models/gemini-1.5-flash"
+        }
+      };
+      
+      console.log("useVoiceSocket: Sending setup message to Gemini Live API");
+      webSocketRef.current.send(JSON.stringify(setupMessage));
+      
       updateConnectionState('connected');
       if(onTranscriptUpdate) onTranscriptUpdate({speaker: 'system', text: 'Voice connection established.'});
     };
@@ -42,14 +62,21 @@ const useVoiceSocket = (
       if (typeof event.data === 'string') {
         try {
             const message = JSON.parse(event.data);
+            console.log("WebSocket message received:", message);
+            
             if (message.type === 'user_transcript') {
                 if(onTranscriptUpdate) onTranscriptUpdate({ speaker: 'user', text: message.text });
             } else if (message.type === 'tutor_transcript') {
                 if(onTranscriptUpdate) onTranscriptUpdate({ speaker: 'tutor', text: message.text });
+                // Start TTS speaking indication
+                if(onTutorSpeakingChange) onTutorSpeakingChange(true);
             } else if (message.type === 'tutor_speaking_started') {
                 if(onTutorSpeakingChange) onTutorSpeakingChange(true);
             } else if (message.type === 'tutor_speaking_finished') {
                 if(onTutorSpeakingChange) onTutorSpeakingChange(false);
+            } else if (message.type === 'setup_complete') {
+                console.log("Gemini Live API setup complete:", message.message);
+                if(onTranscriptUpdate) onTranscriptUpdate({ speaker: 'system', text: 'Voice service ready - you can start speaking!' });
             } else if (message.type === 'error') {
                 if(onErrorChange) onErrorChange(message.message || "Error from voice service.");
             }
@@ -57,9 +84,13 @@ const useVoiceSocket = (
             console.warn("useVoiceSocket: Received non-JSON/malformed JSON:", event.data, e);
             if(onTranscriptUpdate) onTranscriptUpdate({ speaker: 'system', text: `Sys (raw/error): ${event.data}` });
         }
-      } else if (event.data instanceof ArrayBuffer) {
+      } else if (event.data instanceof ArrayBuffer || event.data instanceof Blob) {
+          // Handle audio data from Gemini Live API
+          console.log("Received audio data:", event.data);
           if(onAudioChunkForPlayback) onAudioChunkForPlayback(event.data);
-      } else { console.warn("useVoiceSocket: Unknown message type from backend:", event.data); }
+      } else { 
+          console.warn("useVoiceSocket: Unknown message type from backend:", event.data); 
+      }
     };
 
     webSocketRef.current.onerror = (errorEvent) => {
@@ -105,6 +136,19 @@ const useVoiceSocket = (
     }
   }, []);
 
+  const sendTranscript = useCallback((text) => {
+    if (webSocketRef.current && webSocketRef.current.readyState === WebSocket.OPEN) {
+      const message = {
+        type: 'user_transcript',
+        text: text
+      };
+      console.log('Sending transcript to backend:', message);
+      webSocketRef.current.send(JSON.stringify(message));
+    } else {
+      console.log('Cannot send transcript - WebSocket not open:', webSocketRef.current?.readyState);
+    }
+  }, []);
+
   // Cleanup effect
   useEffect(() => {
     return () => {
@@ -113,6 +157,6 @@ const useVoiceSocket = (
     };
   }, [disconnectSocket]);
 
-  return { connectionState, connectSocket, disconnectSocket, sendAudioData };
+  return { connectionState, connectSocket, disconnectSocket, sendAudioData, sendTranscript };
 };
 export default useVoiceSocket;

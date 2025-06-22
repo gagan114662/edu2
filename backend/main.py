@@ -1,12 +1,13 @@
 import os
 from datetime import datetime, timedelta, timezone # Keep for other uses if any, but not for JWT expiry here
 from fastapi import FastAPI, HTTPException, Depends
+from fastapi.middleware.cors import CORSMiddleware
 # from fastapi.responses import RedirectResponse # No longer used
 # from sqlalchemy import create_engine, Column, Integer, String, select # Keep select, Column, etc.
 from sqlalchemy import create_engine, Column, Integer, String, select
 
 from sqlalchemy.orm import Session, sessionmaker
-from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import declarative_base
 # from jose import jwt, JWTError # No longer used for custom JWTs
 # from google.oauth2 import credentials as google_credentials # No longer used
 # from google_auth_oauthlib.flow import Flow as GoogleFlow # No longer used
@@ -16,7 +17,7 @@ from fastapi.security import OAuth2PasswordBearer
 # from starlette.responses import Response as StarletteResponse # No longer needed for state cookie
 from dotenv import load_dotenv
 from pydantic import BaseModel, Field
-from typing import Optional, Dict, Any, Literal as LiteralType # Added Literal
+from typing import Optional, Dict, Any, Literal as LiteralType, List # Added Literal
 from datetime import datetime # Ensure this specific import is present
 
 # from itsdangerous import URLSafeTimedSerializer # No longer used
@@ -25,6 +26,7 @@ import firebase_admin
 from firebase_admin import credentials as firebase_credentials, auth as firebase_auth, firestore # Added firestore
 import asyncio
 import aiohttp
+import json
 from fastapi import WebSocket, WebSocketDisconnect
 
 load_dotenv()
@@ -76,6 +78,12 @@ class User(Base):
     email = Column(String, unique=True, index=True, nullable=False) # Email from Firebase is verified
     full_name = Column(String, nullable=True)
     picture_url = Column(String, nullable=True)
+    # Curriculum settings
+    grade_level = Column(String, nullable=True)  # e.g. "Grade 5"
+    curriculum_framework = Column(String, nullable=True)  # e.g. "Common Core"
+    # Parent dashboard linking
+    user_role = Column(String, nullable=True, default='student')  # 'student' or 'parent'
+    parent_email = Column(String, nullable=True)  # Email of linked parent for students
 
 def create_db_and_tables():
     Base.metadata.create_all(bind=engine)
@@ -86,10 +94,31 @@ class UserResponse(BaseModel):
     email: str
     full_name: str | None = None
     picture_url: str | None = None
-    class Config:
-        from_attributes = True
+    grade_level: str | None = None
+    curriculum_framework: str | None = None
+    model_config = {"from_attributes": True}
 
-app = FastAPI()
+app = FastAPI(title="AI Tutor API", version="1.0.0")
+
+# CORS Configuration for Production
+origins = [
+    "http://localhost:3000",      # Development
+    "http://127.0.0.1:3000",      # Development with IP
+    "https://dazl.ai",            # Production
+    "https://www.dazl.ai",        # Production with www
+]
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+@app.on_event("startup")
+def on_startup():
+    create_db_and_tables()
 
 def get_db():
     db = SessionLocal()
@@ -246,24 +275,117 @@ class UserProgressResponse(BaseModel):
     createdAt: Optional[datetime] = None
     topics: Dict[str, TopicProgress] = {}
 
-    class Config:
-        from_attributes = True
+    model_config = {"from_attributes": True}
 
 
-# Gemini WebSocket Proxy Configuration
+# Curriculum Data Models
+class CurriculumStandard(BaseModel):
+    id: str  # e.g. "CCSS.MATH.5.NBT.A.1"
+    subject: str  # e.g. "Math"
+    grade: str  # e.g. "Grade 5" 
+    topic: str  # e.g. "Number and Operations in Base Ten"
+    description: str  # Human readable description
+    prerequisites: List[str] = []  # List of prerequisite standard IDs
+
+class UserCurriculumSettings(BaseModel):
+    grade_level: str
+    curriculum_framework: str  # e.g. "Common Core", "Cambridge", etc.
+
+class CurriculumProgressResponse(BaseModel):
+    standard_id: str
+    status: str  # "not_started", "in_progress", "mastered"
+    progress_percentage: float = 0.0
+    last_practiced: Optional[datetime] = None
+
+# Sample curriculum data (in production, this would be from a database)
+SAMPLE_CURRICULUM_STANDARDS = {
+    "Grade 1": {
+        "Math": [
+            CurriculumStandard(
+                id="CCSS.MATH.1.OA.A.1",
+                subject="Math",
+                grade="Grade 1",
+                topic="Operations and Algebraic Thinking",
+                description="Use addition and subtraction within 20 to solve word problems"
+            ),
+            CurriculumStandard(
+                id="CCSS.MATH.1.NBT.A.1",
+                subject="Math", 
+                grade="Grade 1",
+                topic="Number and Operations in Base Ten",
+                description="Count to 120, starting at any number less than 120"
+            )
+        ],
+        "English": [
+            CurriculumStandard(
+                id="CCSS.ELA.1.RL.1",
+                subject="English",
+                grade="Grade 1", 
+                topic="Reading Literature",
+                description="Ask and answer questions about key details in a text"
+            )
+        ]
+    },
+    "Grade 2": {
+        "Math": [
+            CurriculumStandard(
+                id="CCSS.MATH.2.OA.A.1",
+                subject="Math",
+                grade="Grade 2",
+                topic="Operations and Algebraic Thinking", 
+                description="Use addition and subtraction within 100 to solve problems"
+            )
+        ]
+    },
+    "Grade 3": {
+        "Math": [
+            CurriculumStandard(
+                id="CCSS.MATH.3.NF.A.1",
+                subject="Math",
+                grade="Grade 3",
+                topic="Number and Operations—Fractions",
+                description="Understand a fraction 1/b as the quantity formed by 1 part when a whole is partitioned into b equal parts"
+            )
+        ]
+    }
+}
+
+
+# Gemini API Configuration
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-GEMINI_LIVE_API_ENDPOINT_URL = os.getenv("GEMINI_LIVE_API_ENDPOINT_URL") # Example: "wss://speech.googleapis.com/v2/streaming/voice" (this is a guess)
+if not GEMINI_API_KEY:
+    raise ValueError("GEMINI_API_KEY environment variable is required")
+GEMINI_LIVE_API_ENDPOINT_URL = os.getenv("GEMINI_LIVE_API_ENDPOINT_URL", f"wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1alpha.GenerativeService.BidiGenerateContent?key={GEMINI_API_KEY}")
+
+# Initialize Google AI SDK for text generation
+import google.generativeai as genai
+if GEMINI_API_KEY:
+    genai.configure(api_key=GEMINI_API_KEY)
+    print(f"Gemini API configured with key: {GEMINI_API_KEY[:10]}...")
+else:
+    print("WARNING: GEMINI_API_KEY not set")
 
 
 async def client_to_gemini_task(client_ws: WebSocket, gemini_ws: aiohttp.ClientWebSocketResponse):
+    print("client_to_gemini_task started - listening for client messages")
     try:
         while True:
-            data = await client_ws.receive_bytes()
-            if data:
+            # First, check what type of message we're receiving
+            print("Waiting for message from client...")
+            message = await client_ws.receive()
+            print(f"Received message from client: {type(message)}")
+            
+            if "text" in message:
+                # Handle text messages (like setup JSON)
+                text_data = message["text"]
+                print(f"Forwarding text message to Gemini: {text_data[:100]}...")
+                await gemini_ws.send_str(text_data)
+                print("Text message sent to Gemini successfully")
+            elif "bytes" in message:
+                # Handle binary audio data
+                data = message["bytes"]
+                print(f"Forwarding {len(data)} bytes of audio data to Gemini")
                 await gemini_ws.send_bytes(data)
-            # Consider handling text messages if client sends config as text:
-            # text_data = await client_ws.receive_text()
-            # await gemini_ws.send_str(text_data)
     except WebSocketDisconnect:
         print("Client disconnected from proxy while sending to Gemini.")
         # Ensure Gemini connection is closed if client disconnects abruptly
@@ -276,15 +398,20 @@ async def client_to_gemini_task(client_ws: WebSocket, gemini_ws: aiohttp.ClientW
 
 
 async def gemini_to_client_task(client_ws: WebSocket, gemini_ws: aiohttp.ClientWebSocketResponse):
+    print("gemini_to_client_task started - listening for Gemini responses")
     try:
         async for msg in gemini_ws:
+            print(f"Received message from Gemini: {msg.type}")
+            
             if client_ws.client_state == client_ws.client_state.DISCONNECTED:
                 print("Client already disconnected, stopping gemini_to_client_task.")
                 break
 
             if msg.type == aiohttp.WSMsgType.TEXT:
+                print(f"Forwarding text response to client: {msg.data[:100]}...")
                 await client_ws.send_text(msg.data)
             elif msg.type == aiohttp.WSMsgType.BINARY:
+                print(f"Forwarding binary response to client: {len(msg.data)} bytes")
                 await client_ws.send_bytes(msg.data)
             elif msg.type == aiohttp.WSMsgType.CLOSED:
                 print("Gemini WS connection closed by remote.")
@@ -310,85 +437,85 @@ async def gemini_to_client_task(client_ws: WebSocket, gemini_ws: aiohttp.ClientW
 
 @app.websocket("/ws/voice_tutor")
 async def websocket_voice_tutor_endpoint(client_ws: WebSocket):
+    """
+    Simple voice tutor WebSocket endpoint using regular Gemini API
+    """
     await client_ws.accept()
-    print("Client WebSocket connected to /ws/voice_tutor.")
-
-    if not GEMINI_API_KEY or not GEMINI_LIVE_API_ENDPOINT_URL:
-        error_msg = "Backend not configured for Gemini Live API."
-        print(f"Closing WebSocket connection: {error_msg}")
-        await client_ws.send_json({"type": "error", "message": error_msg}) # Send JSON for structured error
-        await client_ws.close(code=1008) # Policy Violation
+    print(f"[{datetime.now()}] Client WebSocket connected to /ws/voice_tutor")
+    
+    if not GEMINI_API_KEY:
+        await client_ws.send_json({
+            "type": "error",
+            "message": "Voice service not configured. Please check API key."
+        })
+        await client_ws.close(code=1008)
         return
-
-    async with aiohttp.ClientSession() as session:
-        gemini_ws_conn = None
+    
+    # Use regular Gemini API - much more reliable
+    model = genai.GenerativeModel('gemini-1.5-flash')
+    chat = model.start_chat(history=[])
+    
+    try:
+        # Send ready message to client
+        await client_ws.send_json({
+            "type": "setup_complete",
+            "message": "Voice service ready"
+        })
+        
+        # Handle client messages
+        while True:
+            message = await client_ws.receive()
+            
+            if "text" in message:
+                try:
+                    data = json.loads(message["text"])
+                    
+                    if data.get("type") == "user_transcript":
+                        # User speech was transcribed by browser
+                        user_text = data.get("text", "")
+                        print(f"[{datetime.now()}] User said: {user_text}")
+                        
+                        # Generate response using Gemini
+                        response = chat.send_message(
+                            f"You are a helpful AI tutor for K-12 students. "
+                            f"Respond in a friendly, educational manner to: {user_text}"
+                        )
+                        ai_response = response.text
+                        print(f"[{datetime.now()}] AI response: {ai_response}")
+                        
+                        # Send response back to client
+                        await client_ws.send_json({
+                            "type": "tutor_transcript",
+                            "text": ai_response
+                        })
+                        
+                    elif data.get("setup"):
+                        # Setup message - acknowledge
+                        await client_ws.send_json({
+                            "type": "setup_complete",
+                            "message": "Setup acknowledged"
+                        })
+                        
+                except json.JSONDecodeError:
+                    print(f"[{datetime.now()}] Invalid JSON received: {message['text']}")
+                    
+            elif "bytes" in message:
+                # Handle audio data - for now, just acknowledge
+                audio_data = message["bytes"]
+                print(f"[{datetime.now()}] Received {len(audio_data)} bytes of audio data")
+                # Audio processing would go here if needed
+                
+    except WebSocketDisconnect:
+        print(f"[{datetime.now()}] Client disconnected from voice tutor")
+    except Exception as e:
+        print(f"[{datetime.now()}] Error in voice tutor: {e}")
         try:
-            print(f"Attempting to connect to Gemini Live API at {GEMINI_LIVE_API_ENDPOINT_URL}")
-            # Actual headers will depend on Gemini API docs. This is a placeholder.
-            # Common practice: "Authorization": f"Bearer {GEMINI_API_KEY}" or "X-Goog-Api-Key": GEMINI_API_KEY
-            headers = {"Authorization": f"Bearer {GEMINI_API_KEY}"}
-
-            gemini_ws_conn = await session.ws_connect(
-                GEMINI_LIVE_API_ENDPOINT_URL,
-                headers=headers,
-                # Add other relevant params like protocols, heartbeat, etc.
-            )
-            print("Successfully connected to Gemini Live API WebSocket.")
-
-            # Run both tasks concurrently
-            # Ensure that if one task finishes (e.g., due to disconnect or error), the other is cancelled.
-            receive_task = asyncio.create_task(client_to_gemini_task(client_ws, gemini_ws_conn))
-            send_task = asyncio.create_task(gemini_to_client_task(client_ws, gemini_ws_conn))
-
-            done, pending = await asyncio.wait(
-                [receive_task, send_task],
-                return_when=asyncio.FIRST_COMPLETED,
-            )
-
-            for task in pending:
-                print(f"Cancelling pending task: {task}")
-                task.cancel()
-
-            # Await done tasks to raise exceptions if any occurred within them
-            for task in done:
-                try:
-                    await task
-                except asyncio.CancelledError:
-                    print(f"Task {task} was cancelled.")
-                except Exception as e:
-                    print(f"Task {task} raised an exception: {e}")
-
-        except aiohttp.ClientConnectorError as e:
-            error_msg = "Failed to connect to AI voice service (connector error)."
-            print(f"{error_msg} Details: {e}")
-            await client_ws.send_json({"type": "error", "message": error_msg})
-        except aiohttp.WSServerHandshakeError as e:
-            error_msg = f"Failed to connect to AI voice service (handshake error: {e.status}, {e.message}). Check API Key and Endpoint URL."
-            print(f"{error_msg} Details: {e}")
-            await client_ws.send_json({"type": "error", "message": error_msg})
-        except Exception as e:
-            error_msg = "An unexpected error occurred with the voice service proxy."
-            print(f"{error_msg} Details: {e}")
-            # Check if this is an asyncio.CancelledError from the main task itself
-            if not isinstance(e, asyncio.CancelledError):
-                 try:
-                    await client_ws.send_json({"type": "error", "message": error_msg})
-                 except Exception: # If sending fails, client is likely gone
-                    pass
-        finally:
-            print("Ensuring WebSocket connections are closed.")
-            if gemini_ws_conn and not gemini_ws_conn.closed:
-                print("Closing Gemini WebSocket connection.")
-                await gemini_ws_conn.close()
-
-            # Check client_ws state before attempting to close
-            if client_ws.client_state != client_ws.client_state.DISCONNECTED:
-                print("Closing client WebSocket connection.")
-                try:
-                    await client_ws.close()
-                except Exception as e_close:
-                    print(f"Error closing client WebSocket: {e_close}")
-            print("WebSocket proxy endpoint finished.")
+            await client_ws.send_json({
+                "type": "error",
+                "message": f"Voice service error: {str(e)}"
+            })
+        except:
+            pass
 
 
 # --- Progress Logging Endpoint ---
@@ -404,7 +531,7 @@ async def log_progress_event(
 
     event_type = event_request.event_type
     # event_data = event_request.event_data # To be used in Phase 2
-    server_timestamp = datetime.utcnow()
+    server_timestamp = datetime.now(timezone.utc)
 
     try:
         doc_snapshot = user_progress_doc_ref.get()
@@ -578,6 +705,9 @@ async def log_progress_event(
 
         return {"status": "success", "message": message}
 
+    except HTTPException:
+        # Re-raise HTTPExceptions (like 400 Bad Request) without wrapping them
+        raise
     except Exception as e:
         print(f"Error processing event {event_type} for user {firebase_uid}: {e}")
         # Consider more specific error logging in production
@@ -614,3 +744,401 @@ async def get_user_progress(
     except Exception as e:
         print(f"Error fetching progress for user {firebase_uid}: {e}")
         raise HTTPException(status_code=500, detail=f"Error fetching progress data: {str(e)}")
+
+
+# --- Curriculum Endpoints ---
+
+@app.get("/api/curriculum/standards/{grade}", tags=["Curriculum"])
+async def get_curriculum_standards(
+    grade: str,
+    subject: Optional[str] = None
+):
+    """Get curriculum standards for a specific grade and optionally subject"""
+    try:
+        if grade not in SAMPLE_CURRICULUM_STANDARDS:
+            raise HTTPException(status_code=404, detail=f"No curriculum found for {grade}")
+        
+        grade_standards = SAMPLE_CURRICULUM_STANDARDS[grade]
+        
+        if subject:
+            if subject not in grade_standards:
+                raise HTTPException(status_code=404, detail=f"No {subject} curriculum found for {grade}")
+            return grade_standards[subject]
+        
+        # Return all subjects for the grade
+        return grade_standards
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Error fetching curriculum standards: {e}")
+        raise HTTPException(status_code=500, detail="Error fetching curriculum standards")
+
+
+@app.put("/api/users/me/curriculum", tags=["Users"])
+async def update_user_curriculum_settings(
+    settings: UserCurriculumSettings,
+    current_user: User = Depends(get_current_active_user),
+    db: Session = Depends(get_db)
+):
+    """Update user's curriculum settings"""
+    try:
+        # Update the user's curriculum settings in the database
+        current_user.grade_level = settings.grade_level
+        current_user.curriculum_framework = settings.curriculum_framework
+        db.commit()
+        db.refresh(current_user)
+        
+        return {"status": "success", "message": "Curriculum settings updated"}
+    except Exception as e:
+        db.rollback()
+        print(f"Error updating curriculum settings: {e}")
+        raise HTTPException(status_code=500, detail="Error updating curriculum settings")
+
+
+@app.get("/api/curriculum/progress", tags=["Curriculum"])
+async def get_curriculum_progress(
+    current_user: User = Depends(get_current_active_user),
+    db_fs: firestore.Client = Depends(get_firestore_db)
+):
+    """Get user's progress on curriculum standards"""
+    try:
+        firebase_uid = current_user.firebase_uid
+        grade_level = current_user.grade_level or "Grade 1"  # Default to Grade 1
+        
+        # Get user's progress data
+        user_progress_doc_ref = db_fs.collection("UserProgress").document(firebase_uid)
+        doc_snapshot = user_progress_doc_ref.get()
+        
+        progress_data = {}
+        if doc_snapshot.exists:
+            progress_data = doc_snapshot.to_dict()
+        
+        # Get curriculum standards for user's grade
+        if grade_level not in SAMPLE_CURRICULUM_STANDARDS:
+            return []
+        
+        curriculum_progress = []
+        grade_standards = SAMPLE_CURRICULUM_STANDARDS[grade_level]
+        
+        for subject, standards in grade_standards.items():
+            for standard in standards:
+                # Check if this standard has been practiced
+                standard_progress = CurriculumProgressResponse(
+                    standard_id=standard.id,
+                    status="not_started",
+                    progress_percentage=0.0
+                )
+                
+                # Check if user has practiced topics related to this standard
+                if "topics" in progress_data:
+                    for topic_name, topic_data in progress_data["topics"].items():
+                        # Simple matching - in production this would be more sophisticated
+                        if (standard.topic.lower() in topic_name.lower() or 
+                            topic_name.lower() in standard.topic.lower()):
+                            attempted = topic_data.get("questionsAttempted", 0)
+                            correct = topic_data.get("questionsCorrect", 0)
+                            
+                            if attempted > 0:
+                                standard_progress.status = "in_progress"
+                                standard_progress.progress_percentage = round((correct / attempted) * 100, 1)
+                                
+                                # Consider mastered if 80% accuracy with at least 5 attempts
+                                if correct / attempted >= 0.8 and attempted >= 5:
+                                    standard_progress.status = "mastered"
+                                    standard_progress.progress_percentage = 100.0
+                                
+                                if "lastPracticed" in topic_data:
+                                    standard_progress.last_practiced = topic_data["lastPracticed"]
+                
+                curriculum_progress.append(standard_progress)
+        
+        return curriculum_progress
+        
+    except Exception as e:
+        print(f"Error fetching curriculum progress: {e}")
+        raise HTTPException(status_code=500, detail="Error fetching curriculum progress")
+
+
+# --- Parent Dashboard Endpoints ---
+
+@app.get("/api/parent/children", tags=["Parent Dashboard"])
+async def get_linked_children(
+    current_user: User = Depends(get_current_active_user),
+    db: Session = Depends(get_db)
+):
+    """Get list of children linked to parent account"""
+    try:
+        # Find all students linked to this parent's email
+        children = db.execute(
+            select(User).where(User.parent_email == current_user.email)
+        ).scalars().all()
+        
+        # Return basic info for each child
+        children_data = []
+        for child in children:
+            children_data.append({
+                "id": child.id,
+                "firebase_uid": child.firebase_uid,
+                "full_name": child.full_name,
+                "email": child.email,
+                "grade_level": child.grade_level,
+                "curriculum_framework": child.curriculum_framework
+            })
+        
+        return children_data
+        
+    except Exception as e:
+        print(f"Error fetching linked children: {e}")
+        raise HTTPException(status_code=500, detail="Error fetching linked children")
+
+
+@app.get("/api/parent/child/{child_firebase_uid}/progress", tags=["Parent Dashboard"])
+async def get_child_progress(
+    child_firebase_uid: str,
+    current_user: User = Depends(get_current_active_user),
+    db: Session = Depends(get_db),
+    db_fs: firestore.Client = Depends(get_firestore_db)
+):
+    """Get progress data for a specific child (parent access only)"""
+    try:
+        # Verify parent has access to this child
+        child = db.execute(
+            select(User).where(
+                User.firebase_uid == child_firebase_uid,
+                User.parent_email == current_user.email
+            )
+        ).scalar_one_or_none()
+        
+        if not child:
+            raise HTTPException(status_code=404, detail="Child not found or not linked to your account")
+        
+        # Get child's progress data from Firestore
+        user_progress_doc_ref = db_fs.collection("UserProgress").document(child_firebase_uid)
+        doc_snapshot = user_progress_doc_ref.get()
+        
+        if doc_snapshot.exists:
+            progress_data = doc_snapshot.to_dict()
+            # Add child info to progress data
+            progress_data['child_info'] = {
+                'name': child.full_name,
+                'email': child.email,
+                'grade_level': child.grade_level,
+                'curriculum_framework': child.curriculum_framework
+            }
+            return progress_data
+        else:
+            # Return empty progress with child info
+            return {
+                'child_info': {
+                    'name': child.full_name,
+                    'email': child.email,
+                    'grade_level': child.grade_level,
+                    'curriculum_framework': child.curriculum_framework
+                },
+                'totalSessions': 0,
+                'totalTimeSpentSeconds': 0,
+                'topics': {},
+                'lastActivityTimestamp': None
+            }
+            
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Error fetching child progress: {e}")
+        raise HTTPException(status_code=500, detail="Error fetching child progress")
+
+
+class LinkParentRequest(BaseModel):
+    parent_email: str
+
+@app.post("/api/users/me/link-parent", tags=["Users"])
+async def link_parent_account(
+    request: LinkParentRequest,
+    current_user: User = Depends(get_current_active_user),
+    db: Session = Depends(get_db)
+):
+    """Link a parent email to current student account"""
+    try:
+        # Validate email format (basic check)
+        if "@" not in request.parent_email:
+            raise HTTPException(status_code=400, detail="Invalid email format")
+        
+        # Update current user's parent_email
+        current_user.parent_email = request.parent_email
+        db.commit()
+        db.refresh(current_user)
+        
+        return {"status": "success", "message": f"Parent account {request.parent_email} linked successfully"}
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        db.rollback()
+        print(f"Error linking parent account: {e}")
+        raise HTTPException(status_code=500, detail="Error linking parent account")
+
+
+# --- AI Chat Endpoints ---
+
+class ChatMessage(BaseModel):
+    message: str
+    context: Optional[str] = None  # Optional context like curriculum topic
+
+class ChatResponse(BaseModel):
+    response: str
+    context: Optional[str] = None
+
+@app.post("/api/chat/ask", response_model=ChatResponse, tags=["AI Chat"])
+async def ask_tutor(
+    chat_request: ChatMessage,
+    current_user: User = Depends(get_current_active_user),
+    db_fs: firestore.Client = Depends(get_firestore_db)
+):
+    """Ask the AI tutor a question with curriculum-aware responses"""
+    try:
+        if not GEMINI_API_KEY:
+            raise HTTPException(status_code=503, detail="AI service not configured")
+        
+        # Get user's curriculum context
+        grade_level = current_user.grade_level or "Grade 1"
+        curriculum_framework = current_user.curriculum_framework or "Common Core"
+        
+        # Create curriculum-aware system prompt
+        system_prompt = f"""You are a helpful AI tutor for K-12 students. Here's important context about your student:
+
+- Grade Level: {grade_level}
+- Curriculum: {curriculum_framework}
+- Student Name: {current_user.full_name or 'Student'}
+
+Guidelines for your responses:
+1. Keep explanations appropriate for {grade_level} level
+2. Use encouraging and patient tone suitable for children
+3. Align with {curriculum_framework} standards when applicable
+4. Break down complex concepts into simple steps
+5. Use examples and analogies that kids can understand
+6. If asked about topics beyond their grade level, gently redirect to age-appropriate content
+7. Always be supportive and positive
+
+Current topic context: {chat_request.context or 'General learning'}
+
+Student's question: {chat_request.message}
+
+Provide a helpful, educational response:"""
+
+        # Use Gemini to generate response
+        model = genai.GenerativeModel('gemini-1.5-flash')
+        
+        # Configure safety settings for child-safe content
+        safety_settings = [
+            {
+                "category": "HARM_CATEGORY_HARASSMENT",
+                "threshold": "BLOCK_MEDIUM_AND_ABOVE"
+            },
+            {
+                "category": "HARM_CATEGORY_HATE_SPEECH",
+                "threshold": "BLOCK_MEDIUM_AND_ABOVE"
+            },
+            {
+                "category": "HARM_CATEGORY_SEXUALLY_EXPLICIT",
+                "threshold": "BLOCK_MEDIUM_AND_ABOVE"
+            },
+            {
+                "category": "HARM_CATEGORY_DANGEROUS_CONTENT",
+                "threshold": "BLOCK_MEDIUM_AND_ABOVE"
+            }
+        ]
+        
+        response = model.generate_content(
+            system_prompt,
+            safety_settings=safety_settings
+        )
+        
+        # Log the interaction for progress tracking
+        try:
+            await log_chat_interaction(
+                current_user.firebase_uid,
+                chat_request.message,
+                response.text,
+                chat_request.context,
+                db_fs
+            )
+        except Exception as log_error:
+            print(f"Failed to log chat interaction: {log_error}")
+            # Continue even if logging fails
+        
+        return ChatResponse(
+            response=response.text,
+            context=chat_request.context
+        )
+        
+    except Exception as e:
+        print(f"Error in AI chat: {e}")
+        # Provide a fallback response
+        return ChatResponse(
+            response="I'm sorry, I'm having trouble right now. Please try asking your question again or try a simpler version of your question.",
+            context=chat_request.context
+        )
+
+async def log_chat_interaction(firebase_uid: str, question: str, answer: str, context: Optional[str], db_fs):
+    """Log chat interactions for learning analytics"""
+    try:
+        interaction_data = {
+            'timestamp': datetime.now(timezone.utc),
+            'question': question,
+            'answer_length': len(answer),
+            'context': context,
+            'interaction_type': 'chat'
+        }
+        
+        # Store in Firestore under user's chat history
+        chat_collection = db_fs.collection("ChatHistory").document(firebase_uid).collection("interactions")
+        chat_collection.add(interaction_data)
+        
+        # Also update progress if context relates to a curriculum topic
+        if context:
+            progress_doc_ref = db_fs.collection("UserProgress").document(firebase_uid)
+            progress_doc_ref.update({
+                'lastActivityTimestamp': datetime.now(timezone.utc),
+                # Optionally increment a chat counter
+                'totalChatInteractions': firestore.Increment(1)
+            })
+            
+    except Exception as e:
+        print(f"Error logging chat interaction: {e}")
+        # Don't raise - logging is not critical
+
+
+@app.get("/api/chat/history", tags=["AI Chat"])
+async def get_chat_history(
+    current_user: User = Depends(get_current_active_user),
+    db_fs: firestore.Client = Depends(get_firestore_db),
+    limit: int = 20
+):
+    """Get recent chat history for the user"""
+    try:
+        firebase_uid = current_user.firebase_uid
+        
+        # Get recent chat interactions
+        chat_collection = db_fs.collection("ChatHistory").document(firebase_uid).collection("interactions")
+        
+        # Order by timestamp, most recent first
+        query = chat_collection.order_by('timestamp', direction=firestore.Query.DESCENDING).limit(limit)
+        docs = query.stream()
+        
+        interactions = []
+        for doc in docs:
+            data = doc.to_dict()
+            interactions.append({
+                'id': doc.id,
+                'timestamp': data.get('timestamp'),
+                'question': data.get('question'),
+                'answer_length': data.get('answer_length'),
+                'context': data.get('context'),
+                'interaction_type': data.get('interaction_type')
+            })
+        
+        return interactions
+        
+    except Exception as e:
+        print(f"Error fetching chat history: {e}")
+        raise HTTPException(status_code=500, detail="Error fetching chat history")

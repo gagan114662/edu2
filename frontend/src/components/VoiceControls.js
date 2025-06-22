@@ -23,11 +23,18 @@ const VoiceControls = ({
   // Disable button if connecting, or if tutor is speaking and user isn't already listening (to prevent interrupting self), or if there's a mic error.
   const isDisabled = isConnecting || (tutorIsSpeaking && !isListening) || !!micError;
 
+  const handleButtonClick = (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    onToggleListen();
+  };
+
   return (
     <div className="my-4 p-4 border rounded-md shadow-sm bg-gray-50">
       <div className="mb-3 text-center">
         <button
-          onClick={onToggleListen}
+          type="button"
+          onClick={handleButtonClick}
           disabled={isDisabled}
           className={`px-6 py-3 font-semibold rounded-lg shadow-md focus:outline-none focus:ring-2 focus:ring-offset-2 ${buttonClassName}`}
           style={{ minWidth: '180px' }}
